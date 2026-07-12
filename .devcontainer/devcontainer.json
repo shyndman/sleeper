@@ -1,0 +1,13 @@
+{
+  "name": "sleeper",
+  "build": { "dockerfile": "Dockerfile" },
+  "runArgs": ["--gpus", "all"],
+  "mounts": [
+    // Wheel cache: first sync downloads ~5GB of nvidia/torch wheels; every
+    // container rebuild after that resyncs from this volume in seconds.
+    "source=sleeper-uv-cache,target=/root/.cache/uv,type=volume",
+    // Model cache: moshi/nemo pull weights from HF hub; survive rebuilds.
+    "source=sleeper-hf-cache,target=/root/.cache/huggingface,type=volume"
+  ],
+  "postCreateCommand": "uv sync --locked"
+}
