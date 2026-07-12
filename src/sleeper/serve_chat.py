@@ -48,8 +48,8 @@ from moshi.models.tts import DEFAULT_DSM_TTS_REPO, TTSModel
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
-from live_chat_scratch.tts_pytorch_streaming import TTSGen, prepare_script
-from live_chat_scratch.bargein_test import (
+from sleeper.tts_pytorch_streaming import TTSGen, prepare_script
+from sleeper.bargein_test import (
     META_PATH as BARGEIN_META,
     MODEL_PATH as BARGEIN_ONNX,
     SAMPLE_RATE as MIC_SR,

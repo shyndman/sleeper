@@ -1425,43 +1425,6 @@ wheels = [
 ]
 
 [[package]]
-name = "live-chat-scratch"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "moshi" },
-    { name = "nemo-toolkit", extra = ["asr"] },
-    { name = "onnxruntime" },
-    { name = "pydantic-ai" },
-    { name = "silero-vad" },
-    { name = "sounddevice" },
-    { name = "sphn" },
-    { name = "torch" },
-    { name = "torchaudio" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "moshi", specifier = "==0.2.11" },
-    { name = "nemo-toolkit", extras = ["asr"], specifier = ">=2.6.2" },
-    { name = "onnxruntime", specifier = ">=1.27.0" },
-    { name = "pydantic-ai", specifier = ">=2.6.0" },
-    { name = "silero-vad", specifier = ">=6.2.1" },
-    { name = "sounddevice" },
-    { name = "sphn" },
-    { name = "torch" },
-    { name = "torchaudio", specifier = "==2.7.1" },
-]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.1.1" }]
-
-[[package]]
 name = "llvmlite"
 version = "0.48.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3256,6 +3219,43 @@ sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
 ]
+
+[[package]]
+name = "sleeper"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "moshi" },
+    { name = "nemo-toolkit", extra = ["asr"] },
+    { name = "onnxruntime" },
+    { name = "pydantic-ai" },
+    { name = "silero-vad" },
+    { name = "sounddevice" },
+    { name = "sphn" },
+    { name = "torch" },
+    { name = "torchaudio" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "moshi", specifier = "==0.2.11" },
+    { name = "nemo-toolkit", extras = ["asr"], specifier = ">=2.6.2" },
+    { name = "onnxruntime", specifier = ">=1.27.0" },
+    { name = "pydantic-ai", specifier = ">=2.6.0" },
+    { name = "silero-vad", specifier = ">=6.2.1" },
+    { name = "sounddevice" },
+    { name = "sphn" },
+    { name = "torch" },
+    { name = "torchaudio", specifier = "==2.7.1" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.1.1" }]
 
 [[package]]
 name = "smmap"
