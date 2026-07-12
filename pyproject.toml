@@ -1,0 +1,23 @@
+[project]
+name = "live-chat-scratch"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Scott Hyndman", email = "scotty.hyndman@gmail.com" }
+]
+requires-python = ">=3.12,<3.13"
+# Kyutai TTS (moshi) pulls sentencepiece 0.2.0, which has no cp313 wheel and
+# fails to source-build; pin to 3.12 so uv always resolves a wheel.
+dependencies = [
+    "moshi==0.2.11",
+    "torch",
+    "sphn",
+    "sounddevice",
+    "onnxruntime>=1.27.0",
+    "torchaudio==2.7.1",
+    "silero-vad>=6.2.1",
+    "pydantic-ai>=2.6.0",
+    "nemo-toolkit[asr]>=2.6.2",
+]
+
