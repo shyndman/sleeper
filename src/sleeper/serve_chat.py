@@ -1,13 +1,13 @@
 """Full-duplex voice chat: mic -> VAD -> ASR/turn-taking -> LLM -> TTS -> speakers.
 
-Output side (also reachable over HTTP, see ask.py / audition.py):
+Output side (also reachable over HTTP, see ask.py):
 
   POST /ask {"prompt": "..."}            speak the LLM's streamed answer
   POST /say {"text": "...", "voice"?}    speak text directly, optional voice
                                          (kyutai/tts-voices name, see GET /voices)
 
   mic or HTTP -> turns queue -> turn thread (LLM streaming, full chat history)
-       -> sentences queue -> TTS thread (persistent TTSGen)
+       -> sentences queue -> TTS thread (persistent LMGen)
        -> bounded pcm queue -> sounddevice callback -> speakers
 
 Input side (listen_worker): Silero VAD fronts everything. While the user holds
@@ -28,6 +28,7 @@ import re
 import threading
 import time
 from collections import deque
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -42,13 +43,13 @@ import onnxruntime as ort
 import sounddevice as sd
 import torch
 
-from moshi.conditioners import ConditionAttributes
+from moshi.conditioners import ConditionAttributes, dropout_all_conditions
+from moshi.models.lm import LMGen
 from moshi.models.loaders import CheckpointInfo
-from moshi.models.tts import DEFAULT_DSM_TTS_REPO, TTSModel
+from moshi.models.tts import DEFAULT_DSM_TTS_REPO, TTSModel, script_to_entries
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
-from sleeper.tts_pytorch_streaming import TTSGen, prepare_script
 from sleeper.bargein_test import (
     META_PATH as BARGEIN_META,
     MODEL_PATH as BARGEIN_ONNX,
@@ -113,14 +114,23 @@ stopping = threading.Event()
 
 
 class Synth:
-    """Owns the TTSGen and its per-voice/per-turn lifecycle."""
+    """Owns the streaming TTS generator and its per-voice/per-turn lifecycle.
+
+    The LMGen wiring — sampling hooks, delay-masked audio tokens, and the
+    pump/flush loops — is adapted from kyutai's delayed-streams-modeling
+    scripts/tts_pytorch_streaming.py (MIT license).
+    """
 
     def __init__(self, tts_model: TTSModel) -> None:
         self.tts_model = tts_model
-        self.gen: TTSGen | None = None
+        self.lm_gen: LMGen | None = None
         self.voice: str | None = None
         self.first_turn = True
         self._attrs_cache: dict[str, ConditionAttributes] = {}
+        # Script state machine: text entries queued but not yet consumed by the LM.
+        self.script_state = tts_model.machine.new_state([])
+        self.offset = 0  # LM steps since the last reset; drives the delay masks
+        self._streaming: ExitStack | None = None  # owns LMGen streaming teardown
 
     def _attrs(self, voice: str) -> ConditionAttributes:
         if voice not in self._attrs_cache:
@@ -129,6 +139,50 @@ class Synth:
             )
         return self._attrs_cache[voice]
 
+    def _condition_tensors(self, attrs: ConditionAttributes) -> dict:
+        tts_model = self.tts_model
+        attributes = [attrs]
+        if tts_model.cfg_coef != 1.0:
+            if tts_model.valid_cfg_conditionings:
+                raise ValueError(
+                    "This model does not support direct CFG, but was trained with "
+                    "CFG distillation. Pass instead `cfg_coef` to `make_condition_attributes`."
+                )
+            # Direct CFG doubles the batch: real conditions + nulled conditions.
+            attributes = attributes + dropout_all_conditions(attributes)
+        assert tts_model.lm.condition_provider is not None
+        prepared = tts_model.lm.condition_provider.prepare(attributes)
+        return tts_model.lm.condition_provider(prepared)
+
+    # ---- LMGen sampling hooks (see class docstring for provenance) ----
+
+    def _on_text_logits_hook(self, text_logits: torch.Tensor) -> torch.Tensor:
+        if self.tts_model.padding_bonus:
+            text_logits[..., self.tts_model.machine.token_ids.pad] += (
+                self.tts_model.padding_bonus
+            )
+        return text_logits
+
+    def _on_audio_hook(self, audio_tokens: torch.Tensor) -> None:
+        # Zero the audio codebooks until each one's delay has elapsed.
+        audio_offset = self.tts_model.lm.audio_offset
+        delays = self.tts_model.lm.delays
+        for q in range(audio_tokens.shape[1]):
+            delay = delays[q + audio_offset]
+            if self.offset < delay + self.tts_model.delay_steps:
+                audio_tokens[:, q] = self.tts_model.machine.token_ids.zero
+
+    def _on_text_hook(self, text_tokens: torch.Tensor) -> None:
+        # The script state machine substitutes queued script tokens for the
+        # model's sampled text tokens, consuming entries as it goes.
+        out_tokens = [
+            self.tts_model.machine.process(self.offset, self.script_state, token)[0]
+            for token in text_tokens.tolist()
+        ]
+        text_tokens[:] = torch.tensor(
+            out_tokens, dtype=torch.long, device=text_tokens.device
+        )
+
     def _on_frame(self, frame: torch.Tensor) -> None:
         if (frame != -1).all():
             pcm = self.tts_model.mimi.decode(frame[:, 1:, :]).cpu().numpy()
@@ -136,48 +190,94 @@ class Synth:
                 pcms.put(np.clip(pcm[0, 0], -1, 1))  # blocks = backpressure
                 counters["enqueued"] += 1
 
+    def _step(self) -> None:
+        assert self.lm_gen is not None
+        tts_model = self.tts_model
+        missing = tts_model.lm.n_q - tts_model.lm.dep_q
+        input_tokens = torch.full(
+            (1, missing, 1),
+            tts_model.machine.token_ids.zero,
+            dtype=torch.long,
+            device=tts_model.lm.device,
+        )
+        frame = self.lm_gen.step(input_tokens)
+        self.offset += 1
+        if frame is not None:
+            self._on_frame(frame)
+
     def set_voice(self, voice: str) -> None:
         if voice == self.voice:
             return
         # Fetch the voice embedding BEFORE tearing down the old gen: a bad
         # voice name (HF 404) must leave the current voice fully usable.
         attrs = self._attrs(voice)
-        if self.gen is not None:
-            # TTSGen.__post_init__ uses streaming_forever, which discards the
-            # ExitStack that would undo streaming. Replicate its close by hand:
-            # clear LMGen-tree state, then state.__exit__ closes the state's
-            # own exit_stack, which exits lm_model.streaming(...).
-            gen, self.gen, self.voice = self.gen, None, None
-            state = gen.lm_gen._streaming_state
-            assert state is not None
-            gen.lm_gen._stop_streaming()
-            state.__exit__(None, None, None)
-        # ponytail: full TTSGen rebuild per voice switch (re-captures CUDA
+        if self._streaming is not None:
+            self.lm_gen, self.voice = None, None
+            self._streaming.close()  # exits every submodule streaming state
+            self._streaming = None
+        # ponytail: full LMGen rebuild per voice switch (re-captures CUDA
         # graphs, ~1s). Fine while playback buffer covers it; swap condition
         # tensors in-place if switches ever need to be instant.
-        self.gen = TTSGen(self.tts_model, [attrs], on_frame=self._on_frame)
+        tts_model = self.tts_model
+        tts_model.lm.dep_q = tts_model.n_q
+        self.script_state = tts_model.machine.new_state([])
+        self.offset = 0
+        self.lm_gen = LMGen(
+            tts_model.lm,
+            temp=tts_model.temp,
+            temp_text=tts_model.temp,
+            cfg_coef=tts_model.cfg_coef,
+            condition_tensors=self._condition_tensors(attrs),
+            on_text_logits_hook=self._on_text_logits_hook,
+            on_text_hook=self._on_text_hook,
+            on_audio_hook=self._on_audio_hook,
+            cfg_is_masked_until=None,
+            cfg_is_no_text=True,
+        )
+        # streaming() enters immediately and hands back the ExitStack that
+        # undoes it -- held on self so the next set_voice can close it.
+        self._streaming = self.lm_gen.streaming(1)
         self.voice = voice
         self.first_turn = True
         print(f"[voice] {voice}")
 
     def speak(self, text: str) -> None:
-        assert self.gen is not None, "set_voice must run before speak"
+        assert self.lm_gen is not None, "set_voice must run before speak"
         t = time.perf_counter()
-        for entry in prepare_script(self.tts_model, text, first_turn=self.first_turn):
-            self.gen.append_entry(entry)
-            self.gen.process()
+        entries = script_to_entries(
+            self.tts_model.tokenizer,
+            self.tts_model.machine.token_ids,
+            self.tts_model.mimi.frame_rate,
+            [text],
+            multi_speaker=self.first_turn and self.tts_model.multi_speaker,
+            padding_between=1,
+        )
+        for entry in entries:
+            self.script_state.entries.append(entry)
+            # Pump until only the machine's lookahead buffer remains queued.
+            while (
+                len(self.script_state.entries)
+                > self.tts_model.machine.second_stream_ahead
+            ):
+                self._step()
         self.first_turn = False
         print(f"[tts] {time.perf_counter() - t:.2f}s  {text!r}")
 
     def end_turn(self) -> None:
-        assert self.gen is not None, "set_voice must run before end_turn"
-        self.gen.process_last()
-        # streaming_forever can't be stopped/restarted; the supported way to
-        # start a fresh sequence is resetting the still-open streaming state.
-        self.gen.lm_gen.reset_streaming()
+        assert self.lm_gen is not None, "set_voice must run before end_turn"
+        # Drain queued entries, then run out the model's delay tail so the
+        # last words actually reach the speakers.
+        while len(self.script_state.entries) > 0 or self.script_state.end_step is not None:
+            self._step()
+        additional = self.tts_model.delay_steps + max(self.tts_model.lm.delays) + 8
+        for _ in range(additional):
+            self._step()
+        # Streaming stays open across turns; the supported way to start a
+        # fresh sequence is resetting the still-open streaming state.
+        self.lm_gen.reset_streaming()
         self.tts_model.mimi.reset_streaming()
-        self.gen.offset = 0
-        self.gen.state = self.tts_model.machine.new_state([])
+        self.offset = 0
+        self.script_state = self.tts_model.machine.new_state([])
         self.first_turn = True
 
 
