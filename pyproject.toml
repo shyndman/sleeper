@@ -21,3 +21,20 @@ dependencies = [
     "nemo-toolkit[asr]>=2.6.2",
 ]
 
+[project.scripts]
+serve-chat = "live_chat_scratch.serve_chat:main"
+ask = "live_chat_scratch.ask:main"
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
+
+# bargein_test.py matches pytest's *_test.py pattern but is a library module;
+# scope collection to tests/ so pytest never imports the package by filename.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

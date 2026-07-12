@@ -1427,7 +1427,7 @@ wheels = [
 [[package]]
 name = "live-chat-scratch"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "moshi" },
     { name = "nemo-toolkit", extra = ["asr"] },
@@ -1438,6 +1438,11 @@ dependencies = [
     { name = "sphn" },
     { name = "torch" },
     { name = "torchaudio" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -1452,6 +1457,9 @@ requires-dist = [
     { name = "torch" },
     { name = "torchaudio", specifier = "==2.7.1" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.1.1" }]
 
 [[package]]
 name = "llvmlite"
