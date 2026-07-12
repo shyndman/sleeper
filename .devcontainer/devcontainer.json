@@ -7,7 +7,12 @@
     // container rebuild after that resyncs from this volume in seconds.
     "source=sleeper-uv-cache,target=/root/.cache/uv,type=volume",
     // Model cache: moshi/nemo pull weights from HF hub; survive rebuilds.
-    "source=sleeper-hf-cache,target=/root/.cache/huggingface,type=volume"
+    "source=sleeper-hf-cache,target=/root/.cache/huggingface,type=volume",
+    // omp state (auth, config, memory): bind-mounted from the TR host's
+    // home so it survives rebuilds and is shared across projects. With
+    // Remote-SSH, ${localEnv:HOME} resolves on the TR. Seed it from the
+    // laptop with: rsync --archive ~/.omp tr:
+    "source=${localEnv:HOME}/.omp,target=/root/.omp,type=bind"
   ],
   "postCreateCommand": "uv sync --locked"
 }
