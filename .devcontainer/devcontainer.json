@@ -1,7 +1,7 @@
 {
   "name": "sleeper",
   "build": { "dockerfile": "Dockerfile" },
-  "runArgs": ["--gpus", "all", "--publish", "17393:17393"],
+  "runArgs": ["--gpus", "all", "--publish", "17393:17393", "--network=donweb0"],
   "mounts": [
     // Wheel cache: first sync downloads ~5GB of nvidia/torch wheels; every
     // container rebuild after that resyncs from this volume in seconds.

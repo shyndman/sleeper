@@ -47,7 +47,7 @@ from pydantic_ai.messages import (
 )
 
 PORT = 17393
-LLM_URL = "http://localhost:19922/v1"
+LLM_URL = "http://ollama-nvidia:11434/v1"
 LLM_MODEL = "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M"
 VOICE = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
 # Everything the LLM emits goes straight to TTS, so the instructions steer it toward
