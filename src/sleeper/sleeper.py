@@ -1,46 +1,18 @@
-"""Full-duplex voice chat: mic -> VAD -> ASR/turn-taking -> LLM -> TTS -> speakers.
+"""Remote full-duplex voice chat over separate WebSocket routes."""
 
-Output side (also reachable over HTTP, see ask.py):
-
-  POST /ask {"prompt": "..."}            speak the LLM's streamed answer
-  POST /say {"text": "...", "voice"?}    speak text directly, optional voice
-                                         (kyutai/tts-voices name, see GET /voices)
-
-  mic or HTTP -> turns queue -> turn thread (LLM streaming, full chat history)
-       -> sentences queue -> TTS thread (persistent LMGen)
-       -> bounded pcm queue -> sounddevice callback -> speakers
-
-Input side (listen_worker): Silero VAD fronts everything. While the user holds
-the floor their speech streams through Nemotron cache-aware ASR and smart-turn
-v3 decides end-of-turn (the transcript becomes the next LLM prompt). While the
-assistant holds the floor the barge-in classifier separates real interruptions
-from backchannels; a barge-in cancels the LLM stream, flushes all queued audio,
-and hands the floor back to the user. Chat history keeps only the sentences
-that actually reached the speakers.
-
-Assumes echo-cancelled input (EasyEffects AEC) so the mic never hears the TTS.
-"""
 import asyncio
-import json
-import os
 import queue
 import re
 import threading
 import time
 from collections import deque
 from contextlib import ExitStack
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Literal
 
-# Capture through the EasyEffects echo-cancelled source. Without AEC the mic
-# hears the TTS: the barge-in model interrupts on the bot's own voice and the
-# ASR transcribes it back into the conversation (self-talk loop). Must be set
-# before PortAudio connects to PulseAudio/PipeWire, i.e. before any stream opens.
-os.environ.setdefault("PULSE_SOURCE", "easyeffects_source")
 
 import numpy as np
 import onnxruntime as ort
-import sounddevice as sd
 import torch
 
 from moshi.conditioners import ConditionAttributes, dropout_all_conditions
@@ -50,6 +22,11 @@ from moshi.models.tts import DEFAULT_DSM_TTS_REPO, TTSModel, script_to_entries
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
+from sleeper.messages import (
+    SAY_ADAPTER,
+    TURN_TRANSCRIPT_ADAPTER,
+    TurnTranscript,
+)
 from sleeper.bargein_test import (
     META_PATH as BARGEIN_META,
     MODEL_PATH as BARGEIN_ONNX,
@@ -60,6 +37,7 @@ from sleeper.bargein_test import (
     SpeechGate,
 )
 from omegaconf import open_dict
+from websockets.sync.server import ServerConnection, serve
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -74,8 +52,6 @@ LLM_MODEL = "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M"
 VOICE = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
 # Flush a sentence to TTS as soon as it's complete; the tail stays buffered.
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
-FRAME_SAMPLES = 1920  # one mimi frame: 80ms @ 24kHz, matches output blocksize
-PCM_BUFFER_FRAMES = 64  # ~5s of audio; synthesis blocks when this far ahead
 
 # ---- Voice input (mic -> VAD -> {ASR + smart-turn | barge-in}) ----
 ASR_MODEL = "nvidia/nemotron-speech-streaming-en-0.6b"
@@ -85,32 +61,28 @@ TURN_COMPLETE_THRESHOLD = 0.5  # smart-turn sigmoid; >= means the user is done
 TURN_CHECK_EVERY_BLOCKS = 16  # re-run smart-turn every ~512ms of silence
 FORCE_TURN_END_MS = 2500  # stop waiting on smart-turn after this much silence
 PREROLL_SECONDS = 2.0  # mic history replayed into ASR at capture start
-MIC_DEVICE: str | int | None = None  # default + PULSE_SOURCE = easyeffects_source
 
-# Turns: ("ask", prompt) | ("say", voice, text, done_event). Single consumer
-# (turn thread) so a /say can never interleave into a streaming /ask turn.
-turns: queue.Queue[tuple] = queue.Queue()
-# Sentence stream: ("voice", name) | ("text", sentence) | ("end", done_event?)
-sentences: queue.Queue[tuple[str, str | threading.Event | None]] = queue.Queue()
-pcms: queue.Queue[np.ndarray] = queue.Queue(maxsize=PCM_BUFFER_FRAMES)
-mute = {"on": True}  # True during warmup so the JIT turn stays silent
-
-# ---- Voice input state ----
+# A turn owns its destination connection. Say jobs share the resident synth but
+# never enter the conversation state machine.
+type TurnItem = tuple[ServerConnection, str] | None
+type SentenceItem = (
+    tuple[Literal["conversation", "say"], ServerConnection, str, str, threading.Event]
+    | None
+)
+turns: queue.Queue[TurnItem] = queue.Queue()
+sentences: queue.Queue[SentenceItem] = queue.Queue()
+mute = {"on": True}
 mic_q: queue.Queue[np.ndarray] = queue.Queue()
-# Who holds the floor. Flipped to "assistant" whenever a turn starts, back to
-# "user" on barge-in (listener) or when playback drains (TTS thread).
 mode: dict[str, str] = {"v": "user"}
-# Set on barge-in: stops LLM streaming, makes the synth drop frames, and makes
-# the audio callback flush queued pcm. Cleared by the TTS thread at end-of-turn.
 interrupted = threading.Event()
-# Monotonic pcm-frame counters (1 frame = 80ms). "enqueued" bumped by the synth,
-# "played" by the audio callback; marks[i] = (enqueued watermark when sentence i
-# finished synthesizing, its text) -> reconstructs what the user actually heard.
-counters: dict[str, int] = {"enqueued": 0, "played": 0}
-marks: list[tuple[int, str]] = []
-# Ctrl+C: main sets this so the listener exits its loop and closes the mic
-# stream before the process tears down PortAudio underneath it.
+playback_changed = threading.Event()
 stopping = threading.Event()
+conversation_lock = threading.Lock()
+conversation: dict[str, ServerConnection | None] = {"ws": None}
+# Samples emitted since the current assistant turn began. Marks identify the
+# sample immediately after each complete synthesized sentence.
+playback: dict[str, float | int | None] = {"first": None, "samples": 0}
+marks: list[tuple[int, str]] = []
 
 
 class Synth:
@@ -131,6 +103,8 @@ class Synth:
         self.script_state = tts_model.machine.new_state([])
         self.offset = 0  # LM steps since the last reset; drives the delay masks
         self._streaming: ExitStack | None = None  # owns LMGen streaming teardown
+        self.target: ServerConnection | None = None
+        self.conversation_audio = False
 
     def _attrs(self, voice: str) -> ConditionAttributes:
         if voice not in self._attrs_cache:
@@ -145,8 +119,9 @@ class Synth:
         if tts_model.cfg_coef != 1.0:
             if tts_model.valid_cfg_conditionings:
                 raise ValueError(
-                    "This model does not support direct CFG, but was trained with "
-                    "CFG distillation. Pass instead `cfg_coef` to `make_condition_attributes`."
+                    "This model does not support direct CFG, but was trained "
+                    "with CFG distillation. Pass `cfg_coef` to "
+                    "`make_condition_attributes` instead."
                 )
             # Direct CFG doubles the batch: real conditions + nulled conditions.
             attributes = attributes + dropout_all_conditions(attributes)
@@ -158,9 +133,9 @@ class Synth:
 
     def _on_text_logits_hook(self, text_logits: torch.Tensor) -> torch.Tensor:
         if self.tts_model.padding_bonus:
-            text_logits[..., self.tts_model.machine.token_ids.pad] += (
-                self.tts_model.padding_bonus
-            )
+            text_logits[
+                ..., self.tts_model.machine.token_ids.pad
+            ] += self.tts_model.padding_bonus
         return text_logits
 
     def _on_audio_hook(self, audio_tokens: torch.Tensor) -> None:
@@ -186,9 +161,18 @@ class Synth:
     def _on_frame(self, frame: torch.Tensor) -> None:
         if (frame != -1).all():
             pcm = self.tts_model.mimi.decode(frame[:, 1:, :]).cpu().numpy()
-            if not mute["on"] and not interrupted.is_set():
-                pcms.put(np.clip(pcm[0, 0], -1, 1))  # blocks = backpressure
-                counters["enqueued"] += 1
+            if mute["on"] or self.target is None:
+                return
+            if self.conversation_audio and interrupted.is_set():
+                return
+            samples = np.clip(pcm[0, 0], -1, 1)
+            wire = (samples * 32767.0).astype("<i2").tobytes()
+            self.target.send(wire)
+            if self.conversation_audio:
+                if playback["first"] is None:
+                    playback["first"] = time.monotonic()
+                playback["samples"] = int(playback["samples"] or 0) + len(samples)
+                playback_changed.set()
 
     def _step(self) -> None:
         assert self.lm_gen is not None
@@ -267,7 +251,9 @@ class Synth:
         assert self.lm_gen is not None, "set_voice must run before end_turn"
         # Drain queued entries, then run out the model's delay tail so the
         # last words actually reach the speakers.
-        while len(self.script_state.entries) > 0 or self.script_state.end_step is not None:
+        while (
+            len(self.script_state.entries) > 0 or self.script_state.end_step is not None
+        ):
             self._step()
         additional = self.tts_model.delay_steps + max(self.tts_model.lm.delays) + 8
         for _ in range(additional):
@@ -281,121 +267,130 @@ class Synth:
         self.first_turn = True
 
 
+def _send_transcript(ws: ServerConnection, transcript: TurnTranscript) -> None:
+    ws.send(TURN_TRANSCRIPT_ADAPTER.dump_json(transcript).decode())
+
+
+def _played_samples() -> int:
+    first = playback["first"]
+    emitted = int(playback["samples"] or 0)
+    if first is None:
+        return 0
+    return min(emitted, int(max(0.0, time.monotonic() - float(first)) * 24_000))
+
+
+def _heard_text() -> str:
+    played = _played_samples()
+    return " ".join(text for watermark, text in marks if watermark <= played)
+
+
 def tts_worker(tts_model: TTSModel) -> None:
     synth = Synth(tts_model)
     with torch.no_grad(), tts_model.mimi.streaming(1):
-        # Muted warmup: pays triton JIT + CUDA warmth (~10s) at startup.
         synth.set_voice(VOICE)
         synth.speak("Warming up.")
         synth.end_turn()
         mute["on"] = False
-        print(f"[ready] listening on http://127.0.0.1:{PORT}/ask and /say")
-
-        while True:
-            kind, value = sentences.get()
+        print(f"[ready] ws://0.0.0.0:{PORT}/conversation and /say")
+        while not stopping.is_set():
+            job = sentences.get()
+            if job is None:
+                return
+            kind, ws, voice, text, done = job
+            synth.target = ws
+            synth.conversation_audio = kind == "conversation"
             try:
-                if kind == "voice":
-                    assert isinstance(value, str)
-                    synth.set_voice(value)
-                elif kind == "end":
-                    synth.end_turn()
-                    if marks:
-                        # process_last emits the tail of the final sentence.
-                        marks[-1] = (counters["enqueued"], marks[-1][1])
+                synth.set_voice(voice)
+                if kind == "conversation":
+                    if not interrupted.is_set():
+                        synth.speak(text)
+                        marks.append((int(playback["samples"] or 0), text))
                 else:
-                    assert isinstance(value, str)
-                    if not interrupted.is_set():  # barge-in: drop queued sentences
-                        synth.speak(value)
-                        marks.append((counters["enqueued"], value))
-            except Exception as exc:  # bad voice name etc.: skip, stay alive
-                print(f"[error] {kind}={value!r}: {exc}")
+                    synth.speak(text)
+                synth.end_turn()
+                if kind == "conversation" and marks:
+                    marks[-1] = (int(playback["samples"] or 0), marks[-1][1])
+            except Exception as exc:
+                print(f"[tts error] {exc}")
             finally:
-                if kind == "end":
-                    # Wait for playback to drain (audio_callback task_done's each
-                    # frame; on barge-in it flushes), so end-of-turn == silence.
-                    pcms.join()
-                    was_interrupted = interrupted.is_set()
-                    interrupted.clear()
-                    if not was_interrupted:
-                        mode["v"] = "user"  # floor back to the user
-                    if isinstance(value, threading.Event):
-                        value.set()
+                synth.target = None
+                done.set()
 
 
-async def turn_loop() -> None:
-    """Serialize turns: stream the LLM into sentences, then reconcile history
-    with what actually reached the speakers (barge-in truncates at the last
-    fully-played sentence, so the model knows exactly what the user heard)."""
-    agent = Agent(OpenAIChatModel(LLM_MODEL, provider=OllamaProvider(base_url=LLM_URL)))
-    # Breaking out of run_stream on barge-in abandons the httpx response
-    # mid-read; its teardown lands in an unawaited task as a ReadError
-    # ("Task exception was never retrieved"). Expected — drop just those.
-    def quiet_aborted_stream(loop: asyncio.AbstractEventLoop, context: dict) -> None:
-        import httpcore
-        import httpx
+def _wait_synth_or_interrupt(done: threading.Event) -> None:
+    while not done.wait(0.02) and not interrupted.is_set():
+        pass
 
-        if isinstance(context.get("exception"), (httpx.ReadError, httpcore.ReadError)):
-            return
-        loop.default_exception_handler(context)
 
-    asyncio.get_running_loop().set_exception_handler(quiet_aborted_stream)
+def _wait_for_playback(done_synth: threading.Event) -> bool:
+    while not stopping.is_set():
+        if interrupted.is_set():
+            return False
+        emitted = int(playback["samples"] or 0)
+        if done_synth.is_set() and _played_samples() >= emitted:
+            return True
+        playback_changed.wait(0.05)
+        playback_changed.clear()
+    return False
+
+
+async def turn_loop(agent: Agent) -> None:
     history: list[ModelMessage] = []
-    while True:
-        turn = await asyncio.to_thread(turns.get)
+    while not stopping.is_set():
+        item = await asyncio.to_thread(turns.get)
+        if item is None:
+            return
+        ws, prompt = item
         mode["v"] = "assistant"
-        if turn[0] == "say":
-            _, voice, text, done = turn
-            sentences.put(("voice", voice))
-            sentences.put(("text", text))
-            sentences.put(("end", done))
-            continue
-        _, prompt = turn
+        interrupted.clear()
+        playback.update(first=None, samples=0)
         marks.clear()
-        t0 = time.perf_counter()
-        sentences.put(("voice", VOICE))
+        last_synth_done = threading.Event()
+        last_synth_done.set()
         buffer = ""
         try:
             async with agent.run_stream(prompt, message_history=history) as result:
                 async for delta in result.stream_text(delta=True):
                     if interrupted.is_set():
-                        break  # barge-in: stop generating, drop the tail
+                        break
                     buffer += delta
                     *complete, buffer = SENTENCE_END.split(buffer)
                     for sentence in complete:
-                        if sentence.strip():
-                            sentences.put(("text", sentence.strip()))
-        except Exception as exc:  # LLM down etc.: keep the loop alive
+                        sentence = sentence.strip()
+                        if sentence:
+                            last_synth_done = threading.Event()
+                            sentences.put(
+                                ("conversation", ws, VOICE, sentence, last_synth_done)
+                            )
+                            await asyncio.to_thread(
+                                _wait_synth_or_interrupt, last_synth_done
+                            )
+                            if interrupted.is_set():
+                                break
+        except Exception as exc:
             print(f"[llm error] {exc}")
         if buffer.strip() and not interrupted.is_set():
-            sentences.put(("text", buffer.strip()))
-        done = threading.Event()
-        sentences.put(("end", done))
-        await asyncio.to_thread(done.wait)  # audio finished playing or was flushed
-        spoken = " ".join(t for watermark, t in marks if counters["played"] >= watermark)
+            last_synth_done = threading.Event()
+            sentences.put(("conversation", ws, VOICE, buffer.strip(), last_synth_done))
+            await asyncio.to_thread(_wait_synth_or_interrupt, last_synth_done)
+        completed = await asyncio.to_thread(_wait_for_playback, last_synth_done)
+        spoken = _heard_text()
+        ended_by = "completed" if completed else "interrupted"
+        try:
+            _send_transcript(ws, TurnTranscript("assistant", spoken, ended_by))
+        except Exception:
+            pass
+        if interrupted.is_set():
+            await asyncio.to_thread(last_synth_done.wait)
         history.append(ModelRequest(parts=[UserPromptPart(content=prompt)]))
         history.append(
-            ModelResponse(parts=[TextPart(content=spoken or "(cut off before speaking)")])
+            ModelResponse(
+                parts=[TextPart(content=spoken or "(cut off before speaking)")]
+            )
         )
-        print(f"[turn done] {time.perf_counter() - t0:.2f}s for prompt {prompt!r}")
-
-
-def audio_callback(outdata: np.ndarray, *_args) -> None:
-    if interrupted.is_set():
-        # Barge-in: dump whatever synthesis already queued; play silence.
-        outdata[:] = 0
-        try:
-            while True:
-                pcms.get(block=False)
-                pcms.task_done()
-        except queue.Empty:
-            pass
-        return
-    try:
-        outdata[:, 0] = pcms.get(block=False)
-        pcms.task_done()
-        counters["played"] += 1
-    except queue.Empty:
-        outdata[:] = 0
+        if completed:
+            mode["v"] = "user"
+        interrupted.clear()
 
 
 class StreamingASR:
@@ -504,7 +499,9 @@ class TurnDetector:
         from transformers import WhisperFeatureExtractor
 
         self.extractor = WhisperFeatureExtractor(chunk_length=8)
-        self.session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        self.session = ort.InferenceSession(
+            str(path), providers=["CPUExecutionProvider"]
+        )
 
     def complete_probability(self, audio: np.ndarray) -> float:
         """Probability the utterance (last <=8s kept, per model window) is complete."""
@@ -522,16 +519,7 @@ class TurnDetector:
 
 
 def listen_worker() -> None:
-    """Full-duplex mic loop; owns every voice-input model.
-
-    User turn:      VAD-gated capture -> streaming ASR; on silence, smart-turn
-                    decides end-of-turn and the transcript is queued as the
-                    next LLM prompt. A 2s preroll is replayed into the ASR at
-                    capture start so VAD attack never clips the first word.
-    Assistant turn: VAD-gated barge-in classifier over a rolling 2s window;
-                    a barge-in flushes playback and seeds the next user
-                    capture with the interruption itself.
-    """
+    """Consume 512-sample remote mic frames; own all voice-input models."""
     from silero_vad import load_silero_vad
 
     print("Loading voice input models (VAD / barge-in / smart-turn / ASR)...")
@@ -539,19 +527,17 @@ def listen_worker() -> None:
     vad.reset_states()
     gate = SpeechGate(vad)
     bargein = BargeInDetector(BARGEIN_ONNX, BARGEIN_META)
-    bargein.probability(np.zeros(WINDOW_SAMPLES, dtype=np.float32))  # ORT warmup
+    bargein.probability(np.zeros(WINDOW_SAMPLES, dtype=np.float32))
     turn_detector = TurnDetector(SMART_TURN_ONNX)
     turn_detector.complete_probability(np.zeros(MIC_SR, dtype=np.float32))
     asr = StreamingASR()
-    asr.feed(np.zeros(MIC_SR, dtype=np.float32))  # pay cudnn/autotune cost now
+    asr.feed(np.zeros(MIC_SR, dtype=np.float32))
     asr.reset()
-
     preroll: deque[np.ndarray] = deque(
         maxlen=int(PREROLL_SECONDS * MIC_SR / VAD_FRAME_SAMPLES)
     )
-    # Utterance audio for smart-turn, capped at its 8s analysis window.
     utterance: deque[np.ndarray] = deque(maxlen=int(8 * MIC_SR / VAD_FRAME_SAMPLES))
-    window = np.zeros(WINDOW_SAMPLES, dtype=np.float32)  # rolling 2s for barge-in
+    window = np.zeros(WINDOW_SAMPLES, dtype=np.float32)
     capturing = False
     silence_blocks = 0
     force_blocks = int(FORCE_TURN_END_MS / 1000 * MIC_SR / VAD_FRAME_SAMPLES)
@@ -566,157 +552,125 @@ def listen_worker() -> None:
         capturing = True
         silence_blocks = 0
 
-    def mic_callback(indata: np.ndarray, *_args) -> None:
-        mic_q.put(indata[:, 0].copy())
-
-    with sd.InputStream(
-        samplerate=MIC_SR,
-        blocksize=VAD_FRAME_SAMPLES,  # 512 samples = 32ms, Silero's frame size
-        channels=1,
-        dtype="float32",
-        device=MIC_DEVICE,
-        callback=mic_callback,
-    ):
-        print("[ready] voice loop live")
-        while not stopping.is_set():
-            try:
-                chunk = mic_q.get(timeout=0.25)
-            except queue.Empty:
-                continue
-            preroll.append(chunk)
-            window = np.concatenate([window[len(chunk):], chunk])
-            speaking = gate.update(chunk)
-
-            if mode["v"] == "assistant":
-                capturing = False
-                if speaking and bargein.probability(window) >= bargein.threshold:
-                    print("[barge-in]")
-                    interrupted.set()
-                    mode["v"] = "user"
-                    start_capture()  # the interruption is the next utterance
-                continue
-
-            if not capturing:
-                if speaking:
-                    start_capture()
-                continue
-            utterance.append(chunk)
-            asr.feed(chunk)
-            if speaking:  # gate holds 250ms past the last speech frame
-                silence_blocks = 0
-                continue
-            silence_blocks += 1
-            if silence_blocks % TURN_CHECK_EVERY_BLOCKS == 1:
-                prob = turn_detector.complete_probability(np.concatenate(utterance))
-                ended = prob >= TURN_COMPLETE_THRESHOLD
-            else:
-                # ponytail: fixed silence cap as the smart-turn fallback;
-                # adaptive endpointing only if 2.5s ever feels wrong.
-                ended = silence_blocks >= force_blocks
-            if ended:
-                capturing = False
-                text = asr.text.strip()
-                if text:
-                    print(f"[user] {text}")
-                    mode["v"] = "assistant"
-                    turns.put(("ask", text))
-
-
-class Handler(BaseHTTPRequestHandler):
-    tts_model: TTSModel | None = None
-    _voices: list[str] | None = None
-
-    def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", 0))
-        done: threading.Event | None = None
+    while not stopping.is_set():
         try:
-            body = json.loads(self.rfile.read(length))
-            if self.path == "/ask":
-                turns.put(("ask", str(body["prompt"])))
-            elif self.path == "/say":
-                done = threading.Event()
-                turns.put(("say", str(body.get("voice", VOICE)), str(body["text"]), done))
-            else:
-                self.send_error(404)
-                return
-        except (json.JSONDecodeError, KeyError):
-            self.send_error(400, "expected JSON body with 'prompt' or 'text'")
-            return
-        if done is not None:
-            done.wait()  # /say responds only once the audio finished playing
-            self.send_response(200)
-        else:
-            self.send_response(202)
-        self.end_headers()
-
-    def do_GET(self) -> None:
-        """GET /voices: correctly-suffixed voice names from the voice repo."""
-        if self.path != "/voices":
-            self.send_error(404)
-            return
-        if Handler._voices is None:
-            from huggingface_hub import list_repo_files
-
-            tts_model = Handler.tts_model
-            assert tts_model is not None
-            Handler._voices = sorted(
-                f.removesuffix(tts_model.voice_suffix)
-                for f in list_repo_files(tts_model.voice_repo)
-                if f.endswith(tts_model.voice_suffix)
+            chunk = mic_q.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        preroll.append(chunk)
+        window = np.concatenate([window[len(chunk) :], chunk])
+        speaking = gate.update(chunk)
+        if mode["v"] == "assistant":
+            capturing = False
+            if speaking and bargein.probability(window) >= bargein.threshold:
+                print("[barge-in]")
+                interrupted.set()
+                playback_changed.set()
+                mode["v"] = "user"
+                start_capture()
+            continue
+        if not capturing:
+            if speaking:
+                start_capture()
+            continue
+        utterance.append(chunk)
+        asr.feed(chunk)
+        if speaking:
+            silence_blocks = 0
+            continue
+        silence_blocks += 1
+        if silence_blocks % TURN_CHECK_EVERY_BLOCKS == 1:
+            ended = (
+                turn_detector.complete_probability(np.concatenate(utterance))
+                >= TURN_COMPLETE_THRESHOLD
             )
-        body = json.dumps(Handler._voices).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(body)
+        else:
+            ended = silence_blocks >= force_blocks
+        if ended:
+            capturing = False
+            text = asr.text.strip()
+            ws = conversation["ws"]
+            if text and ws is not None:
+                print(f"[user] {text}")
+                try:
+                    _send_transcript(ws, TurnTranscript("user", text, "turn_detected"))
+                except Exception:
+                    capturing = False
+                    mode["v"] = "user"
+                    continue
+                mode["v"] = "assistant"
+                turns.put((ws, text))
 
-    def log_message(self, format: str, *args) -> None:
-        pass  # keep stdout for pipeline timing lines
+
+def conversation_handler(ws: ServerConnection) -> None:
+    if not conversation_lock.acquire(blocking=False):
+        ws.close(1013, "conversation already active")
+        return
+    conversation["ws"] = ws
+    mode["v"] = "user"
+    try:
+        for message in ws:
+            if not isinstance(message, bytes) or len(message) != 1024:
+                ws.close(1003, "expected 1024-byte PCM frames")
+                return
+            mic_q.put(np.frombuffer(message, dtype="<i2").astype(np.float32) / 32768.0)
+    finally:
+        interrupted.set()
+        playback_changed.set()
+        conversation["ws"] = None
+        conversation_lock.release()
+
+
+def say_handler(ws: ServerConnection) -> None:
+    try:
+        raw = ws.recv()
+        if not isinstance(raw, str):
+            ws.close(1003, "expected Say JSON")
+            return
+        request = SAY_ADAPTER.validate_json(raw)
+        done = threading.Event()
+        sentences.put(("say", ws, request.voice or VOICE, request.text, done))
+        done.wait()
+    except Exception as exc:
+        ws.close(1007, str(exc)[:120])
+
+
+def handler(ws: ServerConnection) -> None:
+    path = ws.request.path
+    if path == "/conversation":
+        conversation_handler(ws)
+    elif path == "/say":
+        say_handler(ws)
+    else:
+        ws.close(1008, "unknown route")
 
 
 def main() -> None:
     print("Loading Kyutai TTS...")
     ckpt = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
     tts_model = TTSModel.from_checkpoint_info(ckpt, n_q=32, temp=0.6, device="cuda")
-    Handler.tts_model = tts_model
-
+    agent = Agent(OpenAIChatModel(LLM_MODEL, provider=OllamaProvider(base_url=LLM_URL)))
     threading.Thread(target=tts_worker, args=(tts_model,), daemon=True).start()
-    threading.Thread(target=lambda: asyncio.run(turn_loop()), daemon=True).start()
+    threading.Thread(target=lambda: asyncio.run(turn_loop(agent)), daemon=True).start()
     listener = threading.Thread(target=listen_worker, daemon=True)
     listener.start()
-
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    with sd.OutputStream(
-        samplerate=tts_model.mimi.sample_rate,
-        blocksize=FRAME_SAMPLES,
-        channels=1,
-        callback=audio_callback,
-    ):
-        try:
+    try:
+        with serve(handler, "0.0.0.0", PORT, compression=None) as server:
             server.serve_forever()
-        except KeyboardInterrupt:
-            print("\n[shutdown] closing mic, audio, and server...")
-        finally:
-            server.server_close()
-            interrupted.set()  # unstick any tts pcms.put backpressure block
-            stopping.set()
-            listener.join(timeout=2)  # let the mic InputStream close cleanly
-    #! HACK: never let interpreter teardown run (see __main__). Both audio
-    #! streams and the HTTP socket are already closed above.
-    os._exit(0)
+    except KeyboardInterrupt:
+        print("\n[shutdown] closing server...")
+    finally:
+        stopping.set()
+        interrupted.set()
+        playback_changed.set()
+        mic_q.put(np.zeros(VAD_FRAME_SAMPLES, dtype=np.float32))
+        turns.put(None)
+        sentences.put(None)
+        listener.join(timeout=2)
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        # Ctrl+C during model load, or a second Ctrl+C that lands inside
-        # main's shutdown path and unwinds past its os._exit.
         pass
-    finally:
-        #! HACK: exit without interpreter teardown. turn_loop's
-        #! `await asyncio.to_thread(turns.get)` parks a non-daemon
-        #! concurrent.futures worker on the turns queue forever, and Python's
-        #! threading._shutdown joins those workers at exit, so a normal exit
-        #! hangs the process after Ctrl+C (verified with py-spy).
-        os._exit(0)

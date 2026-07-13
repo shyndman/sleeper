@@ -19,11 +19,13 @@ dependencies = [
     "silero-vad>=6.2.1",
     "pydantic-ai>=2.6.0",
     "nemo-toolkit[asr]>=2.6.2",
+    "websockets>=16.0",
 ]
 
 [project.scripts]
 sleeper = "sleeper.sleeper:main"
-ask = "sleeper.ask:main"
+sleeper-client = "sleeper.client:main"
+say = "sleeper.say:main"
 
 [build-system]
 requires = ["uv_build>=0.11.16,<0.12.0"]
