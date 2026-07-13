@@ -9,6 +9,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from types import TracebackType
 from typing import Callable
 
 import numpy as np
@@ -22,9 +23,11 @@ from sleeper import client
 from sleeper import server
 from sleeper import sleeper
 from sleeper.conversation import ConversationSession, send_transcript
+from sleeper.conversation import ConversationSession, send_transcript, turn_loop
 from sleeper.messages import SAY_ADAPTER, TURN_TRANSCRIPT_ADAPTER, Say, TurnTranscript
 from sleeper.playback import PlaybackTracker
 from sleeper.tts import SayJob, SpeechQueueItem
+from sleeper.tts import EndOfTurn, SayJob, SpeakWord, SpeechQueueItem
 
 
 @contextmanager
@@ -319,3 +322,82 @@ def test_client_flushes_queued_playback_on_interrupted_assistant_transcript(caps
     asyncio.run(client._receive(Messages(), playback))
     assert playback.empty()
     assert "assistant: cut off [interrupted]" in capsys.readouterr().out
+
+
+def test_turn_loop_logs_llm_request_first_response_and_completion(capsys):
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.sent: list[str | bytes] = []
+
+        def send(self, message: str | bytes) -> None:
+            self.sent.append(message)
+
+    class FakeStreamResult:
+        async def stream_text(self, *, delta: bool):
+            assert delta
+            yield "Hello "
+            yield "there"
+
+    class FakeRunStream:
+        async def __aenter__(self) -> FakeStreamResult:
+            return FakeStreamResult()
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> bool:
+            return False
+
+    class FakeAgent:
+        def run_stream(
+            self, prompt: str, *, message_history: list[object]
+        ) -> FakeRunStream:
+            assert prompt == "How are you?"
+            assert message_history == []
+            return FakeRunStream()
+
+    class FakePlayback:
+        def reset_turn(self) -> None:
+            pass
+
+        def wait_until_complete(
+            self,
+            turn_done: threading.Event,
+            interrupted: threading.Event,
+            stopping: threading.Event,
+        ) -> bool:
+            return True
+
+        def heard_text(self) -> str:
+            return "Hello there"
+
+    connection = FakeConnection()
+    turns: queue.Queue = queue.Queue()
+    turns.put((connection, "How are you?"))
+    turns.put(None)
+    speech_jobs: queue.Queue[SpeechQueueItem] = queue.Queue()
+    asyncio.run(
+        turn_loop(
+            FakeAgent(),
+            turns,
+            speech_jobs,
+            ConversationSession(),
+            FakePlayback(),
+            threading.Event(),
+            "test-voice",
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "[llm] request prompt='How are you?'" in output
+    assert "[llm] first response " in output
+    assert "[llm] complete " in output
+    assert "chars=11 words=2" in output
+    assert isinstance(speech_jobs.get_nowait(), SpeakWord)
+    assert isinstance(speech_jobs.get_nowait(), SpeakWord)
+    assert isinstance(speech_jobs.get_nowait(), EndOfTurn)
+    assert len(connection.sent) == 1
+
+
