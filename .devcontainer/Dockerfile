@@ -14,10 +14,21 @@ COPY --from=oven/bun:latest /usr/local/bin/bun /bin/
 # build-essential: C/C++ toolchain for building wheels that ship no prebuilt binary.
 # libportaudio2: sounddevice, imported by the client/say entrypoints.
 # libsndfile1: soundfile (pulled by nemo/librosa) dlopens it.
+# ffmpeg: audio decode/resample for formats libsndfile doesn't cover.
 # zsh: interactive shell, set as root's login shell for VS Code terminals.
-RUN apt-get update && apt-get install --yes --no-install-recommends \
-    git git-lfs build-essential openssh-client zsh libportaudio2 libsndfile1 \
-    && rm -rf /var/lib/apt/lists/* \
+#
+# The slim image ships a docker-clean hook that deletes downloaded .debs after
+# install; drop it and keep packages so the BuildKit cache mounts below actually
+# accumulate. /var/cache/apt holds the .debs, /var/lib/apt the package lists —
+# both persist on the daemon across rebuilds, so only new/changed packages hit
+# the (painfully slow) deb mirrors. sharing=locked serializes concurrent builds
+# instead of corrupting the cache.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+    && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install --yes --no-install-recommends \
+    git git-lfs build-essential openssh-client zsh libportaudio2 libsndfile1 ffmpeg \
     && git lfs install --system \
     && chsh --shell /bin/zsh root
 
