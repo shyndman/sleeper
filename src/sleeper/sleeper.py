@@ -50,6 +50,20 @@ PORT = 17393
 LLM_URL = "http://localhost:19922/v1"
 LLM_MODEL = "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M"
 VOICE = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
+# Everything the LLM emits goes straight to TTS, so the instructions steer it toward
+# speakable prose: no markup for the synthesizer to read aloud, numbers written out
+# the way they're pronounced, and no long-form structure that only works on a screen.
+SPOKEN_INSTRUCTIONS = """\
+You are a voice assistant. Everything you write is spoken aloud by a text-to-speech
+engine, so write for the ear, not the page:
+- Plain prose only, direct and to the point. No filler, no pleasantries, no markdown,
+  lists, headings, code, emojis, or URLs.
+- Write everything as it should be pronounced: "twenty three degrees", "three thirty
+  PM", "kilometres per hour" -- never digits, symbols, or abbreviations.
+- No parentheticals or asides; if something is secondary, drop it.
+- Be brief. Lead with the answer. If a question genuinely needs a long answer, give
+  the short version and offer to go deeper.
+"""
 # Flush a sentence to TTS as soon as it's complete; the tail stays buffered.
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
@@ -649,7 +663,10 @@ def main() -> None:
     print("Loading Kyutai TTS...")
     ckpt = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
     tts_model = TTSModel.from_checkpoint_info(ckpt, n_q=32, temp=0.6, device="cuda")
-    agent = Agent(OpenAIChatModel(LLM_MODEL, provider=OllamaProvider(base_url=LLM_URL)))
+    agent = Agent(
+        OpenAIChatModel(LLM_MODEL, provider=OllamaProvider(base_url=LLM_URL)),
+        instructions=SPOKEN_INSTRUCTIONS,
+    )
     threading.Thread(target=tts_worker, args=(tts_model,), daemon=True).start()
     threading.Thread(target=lambda: asyncio.run(turn_loop(agent)), daemon=True).start()
     listener = threading.Thread(target=listen_worker, daemon=True)
