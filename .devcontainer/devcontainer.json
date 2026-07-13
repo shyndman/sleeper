@@ -14,5 +14,8 @@
     // laptop with: rsync --archive ~/.omp tr:
     "source=${localEnv:HOME}/.omp,target=/root/.omp,type=bind"
   ],
-  "postCreateCommand": "git lfs pull && uv sync --locked"
+  // The workspace is owned by the TR host user but the container runs as
+  // root, so git refuses to touch it (dubious ownership) until the folder
+  // is marked safe. git-lfs surfaces that as "Not in a Git repository."
+  "postCreateCommand": "git config --global --add safe.directory ${containerWorkspaceFolder} && git lfs pull && uv sync --locked"
 }
