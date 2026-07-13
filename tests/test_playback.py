@@ -38,24 +38,22 @@ def test_played_samples_track_elapsed_wall_clock(clock: Clock) -> None:
     assert tracker.played_samples() == 2400
 
 
-def test_sentence_heard_only_after_its_watermark_plays(clock: Clock) -> None:
+def test_word_heard_only_after_its_watermark_plays(clock: Clock) -> None:
     tracker = PlaybackTracker()
     clock.t = 0.0
-    tracker.begin_sentence("hello world")
-    tracker.record_emission(4800)
-    tracker.finish_sentence()  # watermark moves to 4_800 emitted samples
+    tracker.record_emission(4800)  # audio pumped while the word was consumed
+    tracker.mark_spoken("hello")
     clock.t = 0.1  # only 2_400 played, watermark not yet reached
     assert tracker.heard_text() == ""
     clock.t = 0.3  # 7_200 clamps to 4_800 emitted; watermark reached
-    assert tracker.heard_text() == "hello world"
+    assert tracker.heard_text() == "hello"
 
 
 def test_reset_turn_clears_timing_counts_and_marks(clock: Clock) -> None:
     tracker = PlaybackTracker()
     clock.t = 0.0
     tracker.record_emission(4800)
-    tracker.begin_sentence("hi")
-    tracker.finish_sentence()
+    tracker.mark_spoken("hi")
     clock.t = 1.0
     assert tracker.played_samples() > 0
     assert tracker.heard_text() == "hi"
@@ -91,8 +89,7 @@ def test_two_trackers_are_isolated(clock: Clock) -> None:
     b = PlaybackTracker()
     clock.t = 0.0
     a.record_emission(4800)
-    a.begin_sentence("only a")
-    a.finish_sentence()
+    a.mark_spoken("only a")
     clock.t = 1.0
     assert a.played_samples() == 4800
     assert b.played_samples() == 0

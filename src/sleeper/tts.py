@@ -4,7 +4,7 @@ import queue
 import threading
 import time
 from contextlib import ExitStack
-from typing import Literal
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -15,11 +15,40 @@ from websockets.sync.server import ServerConnection
 
 from sleeper.playback import PlaybackTracker
 
-# A say job shares the resident synth but never enters the conversation state
-# machine; a conversation job's audio is tracked for playback/interruption.
-type SpeechKind = Literal["conversation", "say"]
-type SpeechJob = tuple[SpeechKind, ServerConnection, str, str, threading.Event]
-type SpeechQueueItem = SpeechJob | None
+# One resident synth serves two producers. A conversation turn streams in as
+# individual SpeakWord jobs -- words are fed to the generator as the LLM emits
+# them -- and is closed by a single EndOfTurn. A say job is a self-contained
+# utterance outside the conversation state machine; its audio is not tracked
+# for playback/interruption.
+
+
+@dataclass(slots=True, frozen=True)
+class SpeakWord:
+    """One whitespace-delimited word of the open assistant turn."""
+
+    ws: ServerConnection
+    voice: str
+    text: str
+
+
+@dataclass(slots=True, frozen=True)
+class EndOfTurn:
+    """Close the open assistant turn; `done` fires after flush or abort."""
+
+    done: threading.Event
+
+
+@dataclass(slots=True, frozen=True)
+class SayJob:
+    """Self-contained /say utterance: spoken and flushed as one unit."""
+
+    ws: ServerConnection
+    voice: str
+    text: str
+    done: threading.Event
+
+
+type SpeechQueueItem = SpeakWord | EndOfTurn | SayJob | None
 
 
 class Synth:
@@ -199,6 +228,19 @@ class Synth:
         additional = self.tts_model.delay_steps + max(self.tts_model.lm.delays) + 8
         for _ in range(additional):
             self._step()
+        self._reset_sequence()
+
+    def abort_turn(self) -> None:
+        """Reset without draining: for barge-in and error recovery.
+
+        `_on_frame` drops conversation audio once `interrupted` is set, so
+        draining the queued entries and the delay tail would only burn GPU
+        steps and delay the next turn's first word.
+        """
+        self._reset_sequence()
+
+    def _reset_sequence(self) -> None:
+        assert self.lm_gen is not None, "set_voice must run before a reset"
         # Streaming stays open across turns; the supported way to start a
         # fresh sequence is resetting the still-open streaming state.
         self.lm_gen.reset_streaming()
@@ -223,26 +265,62 @@ def tts_worker(
         synth.speak("Warming up.")
         synth.end_turn()
         print(ready_message)
+        # A conversation turn stays open across SpeakWord jobs so the generator
+        # synthesizes one continuous stream; EndOfTurn (or an interleaved say
+        # job) closes it.
+        turn_open = False
+
+        def close_turn() -> None:
+            nonlocal turn_open
+            if not turn_open:
+                return
+            try:
+                if interrupted.is_set():
+                    synth.abort_turn()
+                else:
+                    synth.end_turn()
+            except Exception as exc:
+                # A failed drain (e.g. the client socket died mid-flush) leaves
+                # the machine mid-sequence; abort back to a clean state.
+                print(f"[tts error] {exc}")
+                synth.abort_turn()
+            synth.target = None
+            turn_open = False
+
         while not stopping.is_set():
             job = jobs.get()
             if job is None:
                 return
-            kind, ws, voice, text, done = job
-            synth.target = ws
-            synth.conversation_audio = kind == "conversation"
-            try:
-                synth.set_voice(voice)
-                if kind == "conversation":
-                    if not interrupted.is_set():
-                        synth.speak(text)
-                        playback.begin_sentence(text)
-                else:
-                    synth.speak(text)
-                synth.end_turn()
-                if kind == "conversation":
-                    playback.finish_sentence()
-            except Exception as exc:
-                print(f"[tts error] {exc}")
-            finally:
-                synth.target = None
-                done.set()
+            if isinstance(job, EndOfTurn):
+                close_turn()
+                job.done.set()
+            elif isinstance(job, SpeakWord):
+                # Words queued behind a barge-in are skipped; the EndOfTurn
+                # behind them resets the generator.
+                if interrupted.is_set():
+                    continue
+                try:
+                    if not turn_open:
+                        synth.set_voice(job.voice)
+                        synth.target = job.ws
+                        synth.conversation_audio = True
+                        turn_open = True
+                    synth.speak(job.text)
+                    playback.mark_spoken(job.text)
+                except Exception as exc:
+                    print(f"[tts error] {exc}")
+            else:
+                # A say job may land mid-conversation-turn; the single
+                # generator must finish that turn's audio first.
+                close_turn()
+                synth.target = job.ws
+                synth.conversation_audio = False
+                try:
+                    synth.set_voice(job.voice)
+                    synth.speak(job.text)
+                    synth.end_turn()
+                except Exception as exc:
+                    print(f"[tts error] {exc}")
+                finally:
+                    synth.target = None
+                    job.done.set()

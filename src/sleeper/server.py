@@ -9,7 +9,7 @@ from websockets.sync.server import ServerConnection
 from sleeper.conversation import ConversationSession
 from sleeper.messages import SAY_ADAPTER
 from sleeper.playback import PlaybackTracker
-from sleeper.tts import SpeechQueueItem
+from sleeper.tts import SayJob, SpeechQueueItem
 
 
 def conversation_handler(
@@ -48,9 +48,7 @@ def say_handler(
             return
         request = SAY_ADAPTER.validate_json(raw)
         done = threading.Event()
-        speech_jobs.put(
-            ("say", ws, request.voice or default_voice, request.text, done)
-        )
+        speech_jobs.put(SayJob(ws, request.voice or default_voice, request.text, done))
         done.wait()
     except Exception as exc:
         ws.close(1007, str(exc)[:120])

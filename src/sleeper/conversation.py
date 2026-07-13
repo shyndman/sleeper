@@ -19,10 +19,11 @@ from websockets.sync.server import ServerConnection
 
 from sleeper.messages import TURN_TRANSCRIPT_ADAPTER, TurnTranscript
 from sleeper.playback import PlaybackTracker
-from sleeper.tts import SpeechQueueItem
+from sleeper.tts import EndOfTurn, SpeakWord, SpeechQueueItem
 
-# Flush a sentence to TTS as soon as it's complete; the tail stays buffered.
-SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+# Words are flushed to TTS the moment they're whitespace-terminated; the
+# partial tail stays buffered until the next delta completes it.
+WORD_BREAK = re.compile(r"\s+")
 
 # A turn owns its destination connection: the socket the assistant reply is
 # spoken to plus the recognized user prompt that triggered it.
@@ -119,11 +120,6 @@ def send_transcript(ws: ServerConnection, transcript: TurnTranscript) -> None:
     ws.send(TURN_TRANSCRIPT_ADAPTER.dump_json(transcript).decode())
 
 
-def _wait_synth_or_interrupt(done: threading.Event, interrupted: threading.Event) -> None:
-    while not done.wait(0.02) and not interrupted.is_set():
-        pass
-
-
 async def turn_loop(
     agent: Agent,
     turns: queue.Queue[TurnQueueItem],
@@ -142,8 +138,7 @@ async def turn_loop(
         ws, prompt = item
         session.assistant_turn_started()
         playback.reset_turn()
-        last_synth_done = threading.Event()
-        last_synth_done.set()
+        turn_done = threading.Event()
         buffer = ""
         try:
             async with agent.run_stream(prompt, message_history=history) as result:
@@ -151,37 +146,20 @@ async def turn_loop(
                     if interrupted.is_set():
                         break
                     buffer += delta
-                    *complete, buffer = SENTENCE_END.split(buffer)
-                    for sentence in complete:
-                        sentence = sentence.strip()
-                        if sentence:
-                            last_synth_done = threading.Event()
-                            speech_jobs.put(
-                                (
-                                    "conversation",
-                                    ws,
-                                    default_voice,
-                                    sentence,
-                                    last_synth_done,
-                                )
-                            )
-                            await asyncio.to_thread(
-                                _wait_synth_or_interrupt, last_synth_done, interrupted
-                            )
-                            if interrupted.is_set():
-                                break
+                    *words, buffer = WORD_BREAK.split(buffer)
+                    for word in words:
+                        if word:
+                            speech_jobs.put(SpeakWord(ws, default_voice, word))
         except Exception as exc:
             print(f"[llm error] {exc}")
-        if buffer.strip() and not interrupted.is_set():
-            last_synth_done = threading.Event()
-            speech_jobs.put(
-                ("conversation", ws, default_voice, buffer.strip(), last_synth_done)
-            )
-            await asyncio.to_thread(
-                _wait_synth_or_interrupt, last_synth_done, interrupted
-            )
+        tail = buffer.strip()
+        if tail and not interrupted.is_set():
+            speech_jobs.put(SpeakWord(ws, default_voice, tail))
+        # EndOfTurn drains the generator's delay tail (or aborts it after a
+        # barge-in) and fires `turn_done` once the worker is finished here.
+        speech_jobs.put(EndOfTurn(turn_done))
         completed = await asyncio.to_thread(
-            playback.wait_until_complete, last_synth_done, interrupted, stopping
+            playback.wait_until_complete, turn_done, interrupted, stopping
         )
         spoken = playback.heard_text()
         ended_by = "completed" if completed else "interrupted"
@@ -190,7 +168,9 @@ async def turn_loop(
         except Exception:
             pass
         if interrupted.is_set():
-            await asyncio.to_thread(last_synth_done.wait)
+            # The worker may still be skipping queued words; don't start the
+            # next turn until it has processed this turn's EndOfTurn.
+            await asyncio.to_thread(turn_done.wait)
         history.append(ModelRequest(parts=[UserPromptPart(content=prompt)]))
         history.append(
             ModelResponse(

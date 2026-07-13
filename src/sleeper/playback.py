@@ -1,12 +1,12 @@
 """Playback progress tracking for the assistant's spoken turn.
 
 The tracker owns the timeline of a single assistant turn: samples emitted to the
-client and, per finished sentence, the emitted-sample watermark at which that
-sentence has fully played. "Heard" audio is derived, not asserted -- the client
-plays at a fixed rate, so a sentence counts as heard only once wall-clock time
-since the first frame implies its watermark of samples has left the speaker.
-This lets the transcript report exactly what the user actually heard when a turn
-is interrupted mid-sentence.
+client and, per spoken word, the emitted-sample watermark past which that word
+counts as heard. "Heard" audio is derived, not asserted -- the client plays at a
+fixed rate, so a word counts as heard only once wall-clock time since the first
+frame implies its watermark of samples has left the speaker. This lets the
+transcript report approximately what the user actually heard when a turn is
+interrupted mid-reply.
 """
 
 import threading
@@ -33,7 +33,7 @@ class PlaybackTracker:
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset_turn(self) -> None:
-        """Clear timing, emitted count, and sentence marks for a new turn."""
+        """Clear timing, emitted count, and word marks for a new turn."""
         with self._lock:
             self._first_emitted_at = None
             self._emitted_samples = 0
@@ -47,21 +47,18 @@ class PlaybackTracker:
             self._emitted_samples += sample_count
         self._changed.set()
 
-    def begin_sentence(self, text: str) -> None:
-        """Mark a sentence as starting at the current emitted-sample count."""
-        with self._lock:
-            self._marks.append((self._emitted_samples, text))
+    def mark_spoken(self, text: str) -> None:
+        """Record `text` as heard once all audio emitted so far has played.
 
-    def finish_sentence(self) -> None:
-        """Move the last sentence's watermark to the now-final emitted count.
-
-        A no-op when no sentence mark exists, matching the guarded update the
-        TTS worker performed before this refactor.
+        The TTS worker marks each word right after the generator consumes it.
+        The word's own audio trails the current emission watermark by the
+        model's delay tail, so on a barge-in `heard_text()` runs a beat ahead
+        of what actually left the speaker -- roughly the delay tail's worth of
+        words. The transcript is a reconciliation aid, not ground truth;
+        word-level marks with that skew still beat sentence-level marks.
         """
         with self._lock:
-            if self._marks:
-                _, text = self._marks[-1]
-                self._marks[-1] = (self._emitted_samples, text)
+            self._marks.append((self._emitted_samples, text))
 
     def _played_locked(self) -> int:
         """Heard-sample estimate; caller must hold `_lock`."""
@@ -76,7 +73,7 @@ class PlaybackTracker:
             return self._played_locked()
 
     def heard_text(self) -> str:
-        """Concatenated text of every sentence whose watermark has played."""
+        """Concatenated text of every word whose watermark has played."""
         with self._lock:
             played = self._played_locked()
             return " ".join(

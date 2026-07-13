@@ -2,6 +2,8 @@
 
 import asyncio
 import functools
+import http.server
+import json
 import queue
 import threading
 import time
@@ -18,11 +20,11 @@ from websockets.sync.server import ServerConnection, serve
 
 from sleeper import client
 from sleeper import server
+from sleeper import sleeper
 from sleeper.conversation import ConversationSession, send_transcript
 from sleeper.messages import SAY_ADAPTER, TURN_TRANSCRIPT_ADAPTER, Say, TurnTranscript
 from sleeper.playback import PlaybackTracker
-from sleeper.sleeper import VOICE
-from sleeper.tts import SpeechQueueItem
+from sleeper.tts import SayJob, SpeechQueueItem
 
 
 @contextmanager
@@ -62,7 +64,7 @@ def harness() -> TransportHarness:
         playback=playback,
         mic_frames=mic_frames,
         speech_jobs=speech_jobs,
-        default_voice=VOICE,
+        default_voice=sleeper.VOICE,
     )
     return TransportHarness(
         session=session,
@@ -71,6 +73,104 @@ def harness() -> TransportHarness:
         speech_jobs=speech_jobs,
         handler=handler,
     )
+
+
+def test_agent_disables_thinking_for_every_run() -> None:
+    requests: list[dict[str, object]] = []
+
+    class ChatHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            content_length = self.headers.get("Content-Length")
+            assert content_length is not None
+            requests.append(json.loads(self.rfile.read(int(content_length))))
+            response = json.dumps(
+                {
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": sleeper.LLM_MODEL,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    llm_url = sleeper.LLM_URL
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ChatHandler)
+    thread = threading.Thread(target=httpd.serve_forever)
+    thread.start()
+    sleeper.LLM_URL = f"http://127.0.0.1:{httpd.server_port}/v1"
+    try:
+        agent = sleeper.create_llm_agent()
+
+        async def run_calls() -> tuple[str, str]:
+            first = await agent.run("first")
+            second = await agent.run("second")
+            return first.output, second.output
+
+        assert asyncio.run(run_calls()) == ("ok", "ok")
+    finally:
+        sleeper.LLM_URL = llm_url
+        httpd.shutdown()
+        thread.join()
+
+    assert [request["reasoning_effort"] for request in requests] == ["none", "none"]
+
+
+def test_startup_warms_ollama_with_model_and_keep_alive() -> None:
+    received: dict[str, object] = {}
+
+    class WarmupHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            content_length = self.headers.get("Content-Length")
+            assert content_length is not None
+            received["path"] = self.path
+            received["body"] = json.loads(self.rfile.read(int(content_length)))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    ollama_url = sleeper.OLLAMA_URL
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), WarmupHandler)
+    thread = threading.Thread(target=httpd.serve_forever)
+    thread.start()
+    sleeper.OLLAMA_URL = f"http://127.0.0.1:{httpd.server_port}"
+    try:
+        sleeper.warm_llm()
+    finally:
+        sleeper.OLLAMA_URL = ollama_url
+        httpd.shutdown()
+        thread.join()
+
+    assert received == {
+        "path": "/api/chat",
+        "body": {
+            "model": sleeper.LLM_MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "keep_alive": "1440m",
+            "think": False,
+        },
+    }
 
 
 @pytest.mark.parametrize(
@@ -177,11 +277,10 @@ def test_say_routes_request_to_isolated_consumer_and_closes(harness):
 
     def consume_one():
         item = harness.speech_jobs.get(timeout=2)
-        assert item is not None
-        kind, websocket, voice, text, done = item
-        consumed.put((kind, voice, text))
-        websocket.send(audio)
-        done.set()
+        assert isinstance(item, SayJob)
+        consumed.put((item.voice, item.text))
+        item.ws.send(audio)
+        item.done.set()
 
     consumer = threading.Thread(target=consume_one)
     consumer.start()
@@ -197,7 +296,7 @@ def test_say_routes_request_to_isolated_consumer_and_closes(harness):
             websocket.recv()
     consumer.join(timeout=2)
     assert not consumer.is_alive()
-    assert consumed.get_nowait() == ("say", "test-voice", "hello")
+    assert consumed.get_nowait() == ("test-voice", "hello")
     assert closed.value.rcvd.code == 1000
 
 
