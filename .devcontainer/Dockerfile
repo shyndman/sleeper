@@ -7,12 +7,18 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 COPY --from=oven/bun:latest /usr/local/bin/bun /bin/
 
 # git/ssh: VS Code source control inside the container.
-# libportaudio2: sounddevice is imported at module top in sleeper.py.
+# git-lfs: model weights (*.onnx, *.npz) are LFS-tracked; without it the
+#   working tree holds pointer stubs and onnxruntime dies with
+#   "INVALID_PROTOBUF" on load. `git lfs install` registers the smudge filter
+#   so checkouts inside the container materialize the real files.
+# build-essential: C/C++ toolchain for building wheels that ship no prebuilt binary.
+# libportaudio2: sounddevice, imported by the client/say entrypoints.
 # libsndfile1: soundfile (pulled by nemo/librosa) dlopens it.
 # zsh: interactive shell, set as root's login shell for VS Code terminals.
 RUN apt-get update && apt-get install --yes --no-install-recommends \
-    git openssh-client zsh libportaudio2 libsndfile1 \
+    git git-lfs build-essential openssh-client zsh libportaudio2 libsndfile1 \
     && rm -rf /var/lib/apt/lists/* \
+    && git lfs install --system \
     && chsh --shell /bin/zsh root
 
 # omp (oh-my-pi): baked into the image so it survives container rebuilds.

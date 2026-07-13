@@ -14,5 +14,5 @@
     // laptop with: rsync --archive ~/.omp tr:
     "source=${localEnv:HOME}/.omp,target=/root/.omp,type=bind"
   ],
-  "postCreateCommand": "uv sync --locked"
+  "postCreateCommand": "git lfs pull && uv sync --locked"
 }
