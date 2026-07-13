@@ -21,7 +21,7 @@ from sleeper.voice_input import VAD_FRAME_SAMPLES, listen_worker
 
 PORT = 17393
 LLM_URL = "http://ollama-nvidia:11434/v1"
-LLM_MODEL = "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M"
+LLM_MODEL = "hf.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q6_K"
 VOICE = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
 # Everything the LLM emits goes straight to TTS, so the instructions steer it toward
 # speakable prose: no markup for the synthesizer to read aloud, numbers written out
