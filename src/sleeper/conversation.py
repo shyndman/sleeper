@@ -16,6 +16,7 @@ from pydantic_ai.messages import (
     TextPart,
     UserPromptPart,
 )
+from websockets.exceptions import ConnectionClosedOK
 from websockets.sync.server import ServerConnection
 
 from sleeper.messages import TURN_TRANSCRIPT_ADAPTER, TurnTranscript
@@ -195,8 +196,17 @@ async def turn_loop(
         ended_by = "completed" if completed else "interrupted"
         try:
             send_transcript(ws, TurnTranscript("assistant", spoken, ended_by))
-        except Exception:
-            pass
+        except ConnectionClosedOK:
+            print(
+                "[conversation] client disconnected before transcript",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[conversation] transcript send failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
         if interrupted.is_set():
             # The worker may still be skipping queued words; don't start the
             # next turn until it has processed this turn's EndOfTurn.

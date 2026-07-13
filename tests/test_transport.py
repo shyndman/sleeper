@@ -7,7 +7,7 @@ import json
 import queue
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Callable
@@ -15,18 +15,18 @@ from typing import Callable
 import numpy as np
 import pytest
 from pydantic import ValidationError
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
+from websockets.frames import Close
 from websockets.sync.client import connect
 from websockets.sync.server import ServerConnection, serve
 
 from sleeper import client
 from sleeper import server
 from sleeper import sleeper
-from sleeper.conversation import ConversationSession, send_transcript
+from sleeper import tts
 from sleeper.conversation import ConversationSession, send_transcript, turn_loop
 from sleeper.messages import SAY_ADAPTER, TURN_TRANSCRIPT_ADAPTER, Say, TurnTranscript
 from sleeper.playback import PlaybackTracker
-from sleeper.tts import SayJob, SpeechQueueItem
 from sleeper.tts import EndOfTurn, SayJob, SpeakWord, SpeechQueueItem
 
 
@@ -401,3 +401,70 @@ def test_turn_loop_logs_llm_request_first_response_and_completion(capsys):
     assert len(connection.sent) == 1
 
 
+def test_tts_clean_close_abandons_turn_once(monkeypatch, capsys):
+    created: list["FakeSynth"] = []
+
+    class FakeSynth:
+        def __init__(
+            self,
+            tts_model: object,
+            playback: PlaybackTracker,
+            interrupted: threading.Event,
+        ) -> None:
+            self.target: object | None = None
+            self.conversation_audio = False
+            self.conversation_speak_calls = 0
+            self.abort_calls = 0
+            created.append(self)
+
+        def set_voice(self, voice: str) -> None:
+            pass
+
+        def speak(self, text: str) -> None:
+            if not self.conversation_audio:
+                return
+            self.conversation_speak_calls += 1
+            raise ConnectionClosedOK(
+                Close(1000, ""), Close(1000, ""), rcvd_then_sent=True
+            )
+
+        def end_turn(self) -> None:
+            pass
+
+        def abort_turn(self) -> None:
+            self.abort_calls += 1
+
+    class FakeMimi:
+        def streaming(self, batch_size: int):
+            assert batch_size == 1
+            return nullcontext()
+
+    class FakeTtsModel:
+        mimi = FakeMimi()
+
+    monkeypatch.setattr(tts, "Synth", FakeSynth)
+    jobs: queue.Queue[SpeechQueueItem] = queue.Queue()
+    done = threading.Event()
+    connection = object()
+    jobs.put(SpeakWord(connection, "test-voice", "one"))
+    jobs.put(SpeakWord(connection, "test-voice", "two"))
+    jobs.put(SpeakWord(connection, "test-voice", "three"))
+    jobs.put(EndOfTurn(done))
+    jobs.put(None)
+
+    tts.tts_worker(
+        FakeTtsModel(),
+        jobs,
+        PlaybackTracker(),
+        threading.Event(),
+        threading.Event(),
+        "test-voice",
+        "[ready]",
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("[tts] client disconnected; turn abandoned") == 1
+    assert "[tts error]" not in output
+    assert created[0].conversation_speak_calls == 1
+    assert created[0].abort_calls == 1
+    assert done.is_set()

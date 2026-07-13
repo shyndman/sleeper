@@ -12,6 +12,7 @@ from moshi.conditioners import ConditionAttributes, dropout_all_conditions
 from moshi.models.lm import LMGen
 from moshi.models.tts import TTSModel, script_to_entries
 from websockets.sync.server import ServerConnection
+from websockets.exceptions import ConnectionClosedOK
 
 from sleeper.playback import PlaybackTracker
 
@@ -197,7 +198,6 @@ class Synth:
 
     def speak(self, text: str) -> None:
         assert self.lm_gen is not None, "set_voice must run before speak"
-        t = time.perf_counter()
         entries = script_to_entries(
             self.tts_model.tokenizer,
             self.tts_model.machine.token_ids,
@@ -215,7 +215,6 @@ class Synth:
             ):
                 self._step()
         self.first_turn = False
-        print(f"[tts] {time.perf_counter() - t:.2f}s  {text!r}")
 
     def end_turn(self) -> None:
         assert self.lm_gen is not None, "set_voice must run before end_turn"
@@ -264,28 +263,68 @@ def tts_worker(
         synth.set_voice(default_voice)
         synth.speak("Warming up.")
         synth.end_turn()
-        print(ready_message)
+        print(ready_message, flush=True)
         # A conversation turn stays open across SpeakWord jobs so the generator
         # synthesizes one continuous stream; EndOfTurn (or an interleaved say
         # job) closes it.
         turn_open = False
+        turn_failed = False
+        turn_started_at: float | None = None
+
+        def abandon_turn(exc: Exception) -> None:
+            """Drop a broken destination once; queued words wait for EndOfTurn."""
+            nonlocal turn_open, turn_failed, turn_started_at
+            elapsed = (
+                time.perf_counter() - turn_started_at
+                if turn_started_at is not None
+                else 0.0
+            )
+            if isinstance(exc, ConnectionClosedOK):
+                print(
+                    f"[tts] client disconnected; turn abandoned {elapsed:.2f}s",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[tts error] {elapsed:.2f}s {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            try:
+                synth.abort_turn()
+            except Exception as reset_exc:
+                print(
+                    f"[tts reset error] {type(reset_exc).__name__}: {reset_exc}",
+                    flush=True,
+                )
+            synth.target = None
+            turn_open = False
+            turn_failed = True
+            turn_started_at = None
 
         def close_turn() -> None:
-            nonlocal turn_open
+            nonlocal turn_open, turn_failed, turn_started_at
             if not turn_open:
+                turn_failed = False
                 return
+            interrupted_turn = interrupted.is_set()
             try:
-                if interrupted.is_set():
+                if interrupted_turn:
                     synth.abort_turn()
                 else:
                     synth.end_turn()
+                assert turn_started_at is not None
+                elapsed = time.perf_counter() - turn_started_at
+                outcome = "interrupted" if interrupted_turn else "complete"
+                print(f"[tts] turn {outcome} {elapsed:.2f}s", flush=True)
             except Exception as exc:
                 # A failed drain (e.g. the client socket died mid-flush) leaves
                 # the machine mid-sequence; abort back to a clean state.
-                print(f"[tts error] {exc}")
-                synth.abort_turn()
-            synth.target = None
-            turn_open = False
+                abandon_turn(exc)
+            finally:
+                synth.target = None
+                turn_open = False
+                turn_failed = False
+                turn_started_at = None
 
         while not stopping.is_set():
             job = jobs.get()
@@ -295,9 +334,9 @@ def tts_worker(
                 close_turn()
                 job.done.set()
             elif isinstance(job, SpeakWord):
-                # Words queued behind a barge-in are skipped; the EndOfTurn
-                # behind them resets the generator.
-                if interrupted.is_set():
+                # Words queued behind a barge-in or failed socket are skipped;
+                # EndOfTurn resets the generator and opens the next turn cleanly.
+                if interrupted.is_set() or turn_failed:
                     continue
                 try:
                     if not turn_open:
@@ -305,22 +344,41 @@ def tts_worker(
                         synth.target = job.ws
                         synth.conversation_audio = True
                         turn_open = True
+                        turn_started_at = time.perf_counter()
+                        print(f"[tts] turn started voice={job.voice!r}", flush=True)
                     synth.speak(job.text)
                     playback.mark_spoken(job.text)
                 except Exception as exc:
-                    print(f"[tts error] {exc}")
+                    abandon_turn(exc)
             else:
                 # A say job may land mid-conversation-turn; the single
                 # generator must finish that turn's audio first.
                 close_turn()
                 synth.target = job.ws
                 synth.conversation_audio = False
+                started_at = time.perf_counter()
+                print(
+                    f"[tts] say started voice={job.voice!r} chars={len(job.text)}",
+                    flush=True,
+                )
                 try:
                     synth.set_voice(job.voice)
                     synth.speak(job.text)
                     synth.end_turn()
+                    print(
+                        f"[tts] say complete "
+                        f"{time.perf_counter() - started_at:.2f}s",
+                        flush=True,
+                    )
+                except ConnectionClosedOK:
+                    print("[tts] say client disconnected", flush=True)
+                    synth.abort_turn()
                 except Exception as exc:
-                    print(f"[tts error] {exc}")
+                    print(
+                        f"[tts error] say {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    synth.abort_turn()
                 finally:
                     synth.target = None
                     job.done.set()
