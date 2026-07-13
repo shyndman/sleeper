@@ -1,4 +1,4 @@
-"""Headless smoke test for the voice-input stack in sleeper.py.
+"""Headless smoke test for the voice-input stack in voice_input.py.
 
 Streams bria.mp3 through StreamingASR in mic-sized blocks (512 samples),
 verifies the running transcript grows and reset() clears state, and checks
@@ -11,7 +11,7 @@ import pytest
 import sphn
 import torch
 
-from sleeper.sleeper import MIC_SR, SMART_TURN_ONNX, StreamingASR, TurnDetector
+from sleeper.voice_input import MIC_SR, SMART_TURN_ONNX, StreamingASR, TurnDetector
 
 AUDIO_FILE = Path(__file__).parent / "data" / "bria.mp3"
 BLOCK = 512  # same mic blocksize the live loop uses
