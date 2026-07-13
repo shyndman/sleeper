@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
-serve-chat = "sleeper.serve_chat:main"
+sleeper = "sleeper.sleeper:main"
 ask = "sleeper.ask:main"
 
 [build-system]

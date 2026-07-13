@@ -7,7 +7,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 COPY --from=oven/bun:latest /usr/local/bin/bun /bin/
 
 # git/ssh: VS Code source control inside the container.
-# libportaudio2: sounddevice is imported at module top in serve_chat.py.
+# libportaudio2: sounddevice is imported at module top in sleeper.py.
 # libsndfile1: soundfile (pulled by nemo/librosa) dlopens it.
 # zsh: interactive shell, set as root's login shell for VS Code terminals.
 RUN apt-get update && apt-get install --yes --no-install-recommends \

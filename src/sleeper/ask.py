@@ -1,4 +1,4 @@
-"""Client: send a prompt to the serve_chat.py pipeline.
+"""Client: send a prompt to the sleeper.py pipeline.
 
 Usage: uv run python ask.py what is the tallest lighthouse
 """
