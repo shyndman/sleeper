@@ -83,11 +83,12 @@ class ConversationSession:
         with self._state_guard:
             self._phase = "assistant"
 
-    def assistant_turn_started(self) -> None:
-        """Begin an assistant turn: assistant phase, clear interruption."""
+    def assistant_turn_started(self) -> threading.Event:
+        """Begin an assistant turn and return its cleared interruption event."""
         with self._state_guard:
             self._phase = "assistant"
             self._interrupted.clear()
+            return self._interrupted
 
     def assistant_turn_finished(self, completed: bool) -> None:
         """End an assistant turn: return to user only if it completed."""
@@ -122,6 +123,112 @@ def send_transcript(ws: ServerConnection, transcript: TurnTranscript) -> None:
     ws.send(TURN_TRANSCRIPT_ADAPTER.dump_json(transcript).decode())
 
 
+async def _run_turn(
+    agent: Agent,
+    turn: Turn,
+    history: list[ModelMessage],
+    speech_jobs: queue.Queue[SpeechQueueItem],
+    session: ConversationSession,
+    playback: PlaybackTracker,
+    stopping: threading.Event,
+    default_voice: str,
+) -> None:
+    ws, prompt = turn
+
+    interrupted = session.assistant_turn_started()
+    playback.reset_turn()
+
+    turn_done = threading.Event()
+    buffer = ""
+    started_at = time.perf_counter()
+    first_response_at: float | None = None
+    received_chars = 0
+    queued_words = 0
+    stream_succeeded = False
+
+    print(f"[llm] request prompt={prompt!r}", flush=True)
+    try:
+        async with agent.run_stream(prompt, message_history=history) as result:
+            async for delta in result.stream_text(delta=True):
+                received_chars += len(delta)
+
+                if delta and first_response_at is None:
+                    first_response_at = time.perf_counter()
+                    print(
+                        f"[llm] first response "
+                        f"{first_response_at - started_at:.2f}s",
+                        flush=True,
+                    )
+
+                if interrupted.is_set():
+                    break
+
+                buffer += delta
+                *words, buffer = WORD_BREAK.split(buffer)
+                for word in words:
+                    if word:
+                        speech_jobs.put(SpeakWord(ws, default_voice, word))
+                        queued_words += 1
+        stream_succeeded = True
+    except Exception as exc:
+        elapsed = time.perf_counter() - started_at
+        print(
+            f"[llm error] {elapsed:.2f}s {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+    tail = buffer.strip()
+    if tail and not interrupted.is_set():
+        speech_jobs.put(SpeakWord(ws, default_voice, tail))
+        queued_words += 1
+
+    if stream_succeeded:
+        elapsed = time.perf_counter() - started_at
+        outcome = "interrupted" if interrupted.is_set() else "complete"
+        print(
+            f"[llm] {outcome} {elapsed:.2f}s "
+            f"chars={received_chars} words={queued_words}",
+            flush=True,
+        )
+
+    # EndOfTurn drains the generator's delay tail (or aborts it after a
+    # barge-in) and fires `turn_done` once the worker is finished here.
+    speech_jobs.put(EndOfTurn(turn_done))
+    completed = await asyncio.to_thread(
+        playback.wait_until_complete, turn_done, interrupted, stopping
+    )
+    spoken = playback.heard_text()
+    ended_by = "completed" if completed else "interrupted"
+
+    try:
+        send_transcript(ws, TurnTranscript("assistant", spoken, ended_by))
+    except ConnectionClosedOK:
+        print(
+            "[conversation] client disconnected before transcript",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[conversation] transcript send failed: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+    if interrupted.is_set():
+        # The worker may still be skipping queued words; don't start the
+        # next turn until it has processed this turn's EndOfTurn.
+        await asyncio.to_thread(turn_done.wait)
+
+    history.append(ModelRequest(parts=[UserPromptPart(content=prompt)]))
+    history.append(
+        ModelResponse(
+            parts=[TextPart(content=spoken or "(cut off before speaking)")]
+        )
+    )
+
+    session.assistant_turn_finished(completed)
+
+
 async def turn_loop(
     agent: Agent,
     turns: queue.Queue[TurnQueueItem],
@@ -132,89 +239,18 @@ async def turn_loop(
     default_voice: str,
 ) -> None:
     history: list[ModelMessage] = []
-    interrupted = session.interrupted
+
     while not stopping.is_set():
-        item = await asyncio.to_thread(turns.get)
-        if item is None:
+        turn = await asyncio.to_thread(turns.get)
+        if turn is None:
             return
-        ws, prompt = item
-        session.assistant_turn_started()
-        playback.reset_turn()
-        turn_done = threading.Event()
-        buffer = ""
-        started_at = time.perf_counter()
-        first_response_at: float | None = None
-        received_chars = 0
-        queued_words = 0
-        stream_succeeded = False
-        print(f"[llm] request prompt={prompt!r}", flush=True)
-        try:
-            async with agent.run_stream(prompt, message_history=history) as result:
-                async for delta in result.stream_text(delta=True):
-                    received_chars += len(delta)
-                    if delta and first_response_at is None:
-                        first_response_at = time.perf_counter()
-                        print(
-                            f"[llm] first response "
-                            f"{first_response_at - started_at:.2f}s",
-                            flush=True,
-                        )
-                    if interrupted.is_set():
-                        break
-                    buffer += delta
-                    *words, buffer = WORD_BREAK.split(buffer)
-                    for word in words:
-                        if word:
-                            speech_jobs.put(SpeakWord(ws, default_voice, word))
-                            queued_words += 1
-            stream_succeeded = True
-        except Exception as exc:
-            elapsed = time.perf_counter() - started_at
-            print(
-                f"[llm error] {elapsed:.2f}s {type(exc).__name__}: {exc}",
-                flush=True,
-            )
-        tail = buffer.strip()
-        if tail and not interrupted.is_set():
-            speech_jobs.put(SpeakWord(ws, default_voice, tail))
-            queued_words += 1
-        if stream_succeeded:
-            elapsed = time.perf_counter() - started_at
-            outcome = "interrupted" if interrupted.is_set() else "complete"
-            print(
-                f"[llm] {outcome} {elapsed:.2f}s "
-                f"chars={received_chars} words={queued_words}",
-                flush=True,
-            )
-        # EndOfTurn drains the generator's delay tail (or aborts it after a
-        # barge-in) and fires `turn_done` once the worker is finished here.
-        speech_jobs.put(EndOfTurn(turn_done))
-        completed = await asyncio.to_thread(
-            playback.wait_until_complete, turn_done, interrupted, stopping
+        await _run_turn(
+            agent,
+            turn,
+            history,
+            speech_jobs,
+            session,
+            playback,
+            stopping,
+            default_voice,
         )
-        spoken = playback.heard_text()
-        ended_by = "completed" if completed else "interrupted"
-        try:
-            send_transcript(ws, TurnTranscript("assistant", spoken, ended_by))
-        except ConnectionClosedOK:
-            print(
-                "[conversation] client disconnected before transcript",
-                flush=True,
-            )
-        except Exception as exc:
-            print(
-                f"[conversation] transcript send failed: "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
-        if interrupted.is_set():
-            # The worker may still be skipping queued words; don't start the
-            # next turn until it has processed this turn's EndOfTurn.
-            await asyncio.to_thread(turn_done.wait)
-        history.append(ModelRequest(parts=[UserPromptPart(content=prompt)]))
-        history.append(
-            ModelResponse(
-                parts=[TextPart(content=spoken or "(cut off before speaking)")]
-            )
-        )
-        session.assistant_turn_finished(completed)
