@@ -65,8 +65,8 @@ class PlaybackTracker:
     """Heard-sample estimate; caller must hold `_lock`."""
     if self._first_emitted_at is None:
       return 0
-    elapsed = max(0.0, time.monotonic() - self._first_emitted_at)
 
+    elapsed = max(0.0, time.monotonic() - self._first_emitted_at)
     return min(self._emitted_samples, int(elapsed * PLAYBACK_SAMPLE_RATE))
 
   def played_samples(self) -> int:
@@ -100,12 +100,15 @@ class PlaybackTracker:
     while not stopping.is_set():
       if interrupted.is_set():
         return False
+
       with self._lock:
         emitted = self._emitted_samples
         played = self._played_locked()
 
       if synthesis_done.is_set() and played >= emitted:
         return True
+
       self._changed.wait(0.05)
       self._changed.clear()
+
     return False
