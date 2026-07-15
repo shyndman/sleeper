@@ -10,7 +10,7 @@ import onnxruntime as ort
 import torch
 from omegaconf import open_dict
 
-from sleeper.conversation import ConversationSession, TurnQueueItem, send_transcript
+from sleeper.conversation import ConversationSession, QueuedTurn, TurnQueueItem, send_transcript
 from sleeper.interruption import (
   META_PATH as BARGEIN_META,
 )
@@ -257,4 +257,4 @@ def listen_worker(
           session.return_to_user()
           continue
         session.user_turn_finished()
-        turns.put(text)
+        turns.put(QueuedTurn(ws, text))

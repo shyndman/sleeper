@@ -27,7 +27,20 @@ from sleeper.tts import TTS
 if TYPE_CHECKING:
   from moshi.models.tts import TTSModel
 
-type TurnQueueItem = str | None
+@dataclass(slots=True, frozen=True)
+class QueuedTurn:
+  """A recognized prompt bound to the connection that spoke it.
+
+  The owning connection travels with the prompt so the turn loop can drop a
+  prompt whose speaker has since disconnected, instead of answering it aloud to
+  whoever owns the session at dequeue time.
+  """
+
+  ws: ServerConnection
+  prompt: str
+
+
+type TurnQueueItem = QueuedTurn | None
 
 
 @dataclass(slots=True)
@@ -37,10 +50,11 @@ class AssistantTurn:
   _tts: TTS
   _playback: PlaybackTracker
   interrupted: threading.Event
+  target: ServerConnection
   _done: threading.Event = field(default_factory=threading.Event)
 
   def speak(self, word: str) -> None:
-    self._tts.speak_word(word)
+    self._tts.speak_word(self.target, word)
 
   def end(self) -> None:
     """Close generated speech; TTS signals `_done` after flushing or aborting."""
@@ -110,13 +124,13 @@ class ConversationSession:
     with self._state_guard:
       self._phase = "assistant"
 
-  def assistant_turn_started(self) -> AssistantTurn:
+  def assistant_turn_started(self, target: ServerConnection) -> AssistantTurn:
     """Begin and return the complete speech lifecycle for one assistant reply."""
     with self._state_guard:
       self._phase = "assistant"
       self._interrupted.clear()
       self.playback.reset_turn()
-      self._turn = AssistantTurn(self._tts, self.playback, self._interrupted)
+      self._turn = AssistantTurn(self._tts, self.playback, self._interrupted, target)
       return self._turn
 
   def assistant_turn_finished(self, completed: bool) -> None:
@@ -211,19 +225,21 @@ async def _prompt_agent(
 
 async def _run_turn(
   agent: Agent[None, str],
-  prompt: str,
+  item: QueuedTurn,
   history: list[ModelMessage],
   session: ConversationSession,
   stopping: threading.Event,
 ) -> None:
   ws = session.active_connection()
-  if ws is None:
+  if ws is None or ws is not item.ws:
+    # The prompt's speaker is gone, or a different client now owns the session;
+    # dropping it keeps one client's question from being answered to another.
     session.return_to_user()
     return
 
-  turn = session.assistant_turn_started()
+  turn = session.assistant_turn_started(ws)
 
-  async for word in _prompt_agent(agent, prompt, history):
+  async for word in _prompt_agent(agent, item.prompt, history):
     if turn.interrupted.is_set():
       break
     turn.speak(word)
@@ -232,7 +248,7 @@ async def _run_turn(
   completed, spoken = await asyncio.to_thread(turn.wait, stopping)
   history.extend(
     [
-      ModelRequest(parts=[UserPromptPart(content=prompt)]),
+      ModelRequest(parts=[UserPromptPart(content=item.prompt)]),
       ModelResponse(parts=[TextPart(content=spoken or "(interrupted by user)")]),
     ]
   )
@@ -263,11 +279,11 @@ async def turn_loop(
   history: list[ModelMessage] = []
 
   while not stopping.is_set():
-    prompt = await asyncio.to_thread(turns.get)
-    if prompt is None:
+    item = await asyncio.to_thread(turns.get)
+    if item is None:
       return
     try:
-      await _run_turn(agent, prompt, history, session, stopping)
+      await _run_turn(agent, item, history, session, stopping)
     except AgentRunError as exc:
       # Resilience boundary: a turn's model call can fail (host unreachable) or
       # its orchestration can give up (tool-call retries exhausted). Abandon the

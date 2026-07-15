@@ -31,6 +31,7 @@ DEFAULT_VOICE = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
 class SpeakWord:
   """One whitespace-delimited word of the open assistant turn."""
 
+  target: ServerConnection
   text: str
 
 
@@ -60,9 +61,9 @@ class TTS:
   def __init__(self) -> None:
     self._jobs: queue.Queue[SpeechQueueItem] = queue.Queue()
 
-  def speak_word(self, text: str) -> None:
+  def speak_word(self, target: ServerConnection, text: str) -> None:
     """Append one complete word to the current streaming assistant turn."""
-    self._jobs.put(SpeakWord(text))
+    self._jobs.put(SpeakWord(target, text))
 
   def end_turn(self, done: threading.Event) -> None:
     """Flush or abort the assistant turn, then signal its waiter."""
@@ -344,11 +345,8 @@ def _speak_word(synth: Synth, job: SpeakWord) -> None:
     return
   try:
     if not synth.turn_open:
-      target = synth.session.active_connection()
-      if target is None:
-        return
       synth.set_voice(DEFAULT_VOICE)
-      synth.target = target
+      synth.target = job.target
       synth.conversation_audio = True
       synth.turn_open = True
       synth.turn_started_at = time.perf_counter()

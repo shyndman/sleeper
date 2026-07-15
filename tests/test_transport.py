@@ -22,7 +22,7 @@ from websockets.sync.client import connect
 from websockets.sync.server import ServerConnection, serve
 
 from sleeper import client, llm, server, tts
-from sleeper.conversation import ConversationSession, send_transcript, turn_loop
+from sleeper.conversation import ConversationSession, QueuedTurn, send_transcript, turn_loop
 from sleeper.messages import SAY_ADAPTER, TURN_TRANSCRIPT_ADAPTER, Say, TurnTranscript
 from sleeper.playback import PlaybackTracker
 from sleeper.tts import EndOfTurn, SayJob, SpeakWord
@@ -365,7 +365,7 @@ def test_turn_loop_streams_response_to_speech(capsys):
   session = ConversationSession(playback=FakePlayback())
   assert session.try_connect(connection)
   turns: queue.Queue = queue.Queue()
-  turns.put("How are you?")
+  turns.put(QueuedTurn(connection, "How are you?"))
   turns.put(None)
   asyncio.run(
     turn_loop(
@@ -427,12 +427,13 @@ def test_turn_loop_survives_failed_stream_and_reclaims_mic(capsys):
       return ""
 
   session = ConversationSession(playback=FakePlayback())
-  assert session.try_connect(FakeConnection())
+  connection = FakeConnection()
+  assert session.try_connect(connection)
   session.user_turn_finished()
   assert session.is_assistant()
 
   turns: queue.Queue = queue.Queue()
-  turns.put("How are you?")
+  turns.put(QueuedTurn(connection, "How are you?"))
   turns.put(None)
 
   # turn_loop must return normally: the failure is caught, not propagated.
@@ -445,6 +446,50 @@ def test_turn_loop_survives_failed_stream_and_reclaims_mic(capsys):
   # The abandoned turn is drained so the TTS worker closes it.
   assert isinstance(session._tts._jobs.get_nowait(), EndOfTurn)
   assert session._tts._jobs.empty()
+
+
+def test_turn_loop_drops_prompt_from_disconnected_client():
+  """A prompt never outlives its speaker to be answered aloud to another client.
+
+  Reproduces issue #3: the turns queue carried bare prompt text and the
+  destination was resolved via `active_connection()` at execution time, so a
+  prompt queued by client A -- who then disconnected -- was answered to a later
+  client B. Prompts now carry their originating connection and are dropped when
+  that connection no longer owns the session.
+  """
+
+  class FakeConnection:
+    def __init__(self) -> None:
+      self.sent: list[str | bytes] = []
+
+    def send(self, message: str | bytes) -> None:
+      self.sent.append(message)
+
+  class ExplodingAgent:
+    def run_stream(self, prompt: str, *, message_history: list[object]):
+      raise AssertionError("a disconnected client's prompt must never reach the model")
+
+  session = ConversationSession()
+  client_a = FakeConnection()
+  assert session.try_connect(client_a)
+  session.user_turn_finished()
+
+  turns: queue.Queue = queue.Queue()
+  turns.put(QueuedTurn(client_a, "What's the weather?"))
+  turns.put(None)
+
+  # A leaves before the prompt is dequeued; B takes over the session.
+  session.disconnect()
+  client_b = FakeConnection()
+  assert session.try_connect(client_b)
+
+  asyncio.run(turn_loop(ExplodingAgent(), turns, session, threading.Event()))
+
+  # B received nothing: no transcript and no queued speech answering A's prompt.
+  assert client_b.sent == []
+  assert session._tts._jobs.empty()
+  # The mic is handed back so B can start their own turn.
+  assert not session.is_assistant()
 
 
 def test_tts_clean_close_abandons_turn_once(monkeypatch, capsys):
@@ -490,9 +535,9 @@ def test_tts_clean_close_abandons_turn_once(monkeypatch, capsys):
   connection = object()
   session = ConversationSession()
   assert session.try_connect(connection)
-  session._tts.speak_word("one")
-  session._tts.speak_word("two")
-  session._tts.speak_word("three")
+  session._tts.speak_word(connection, "one")
+  session._tts.speak_word(connection, "two")
+  session._tts.speak_word(connection, "three")
   session._tts.end_turn(done)
   session._tts.stop()
 
