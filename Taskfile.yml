@@ -11,8 +11,12 @@ tasks:
     requires:
       vars: [DEPLOY_DEV_HOST, DEPLOY_DEV_PATH]
     cmds:
-      - docker build --tag {{.IMAGE}} .
-      - docker push {{.IMAGE}}
+      - |
+        set -e
+        gpgconf --kill gpg-agent
+        export GPG_TTY="$(tty)"
+        docker build --tag {{.IMAGE}} .
+        docker push {{.IMAGE}}
       # DEPLOY_DEV_PATH stays inside the single quotes so a leading ~ is
       # expanded by the remote shell, not locally.
       - ssh {{.DEPLOY_DEV_HOST}} 'cd {{.DEPLOY_DEV_PATH}} && docker compose pull && docker compose up --detach'
