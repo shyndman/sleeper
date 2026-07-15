@@ -27,6 +27,7 @@ from sleeper.tts import TTS
 if TYPE_CHECKING:
   from moshi.models.tts import TTSModel
 
+
 @dataclass(slots=True, frozen=True)
 class QueuedTurn:
   """A recognized prompt bound to the connection that spoke it.
@@ -60,12 +61,14 @@ class AssistantTurn:
     """Close generated speech; TTS signals `_done` after flushing or aborting."""
     self._tts.end_turn(self._done)
 
-  def wait(self, stopping: threading.Event) -> tuple[bool, str]:
-    """Wait for audible playback and any interrupted TTS cleanup to finish."""
+  def wait_for_playback(self, stopping: threading.Event) -> tuple[bool, str]:
+    """Wait until playback drains, is interrupted, or shutdown begins."""
     completed = self._playback.wait_until_complete(self._done, self.interrupted, stopping)
-    if self.interrupted.is_set():
-      self._done.wait()
     return completed, self._playback.heard_text()
+
+  def wait_for_cleanup(self) -> None:
+    """Wait until the TTS worker has closed or aborted this turn."""
+    self._done.wait()
 
 
 @dataclass(slots=True)
@@ -155,7 +158,9 @@ class ConversationSession:
       self._turn = None
     if turn is not None:
       turn.end()
-      turn.wait(stopping)
+      turn.wait_for_playback(stopping)
+      if turn.interrupted.is_set():
+        turn.wait_for_cleanup()
     with self._state_guard:
       self._phase = "user"
       self._interrupted.clear()
@@ -245,7 +250,7 @@ async def _run_turn(
     turn.speak(word)
   turn.end()
 
-  completed, spoken = await asyncio.to_thread(turn.wait, stopping)
+  completed, spoken = await asyncio.to_thread(turn.wait_for_playback, stopping)
   history.extend(
     [
       ModelRequest(parts=[UserPromptPart(content=item.prompt)]),
@@ -266,6 +271,11 @@ async def _run_turn(
       f"[conversation] transcript send failed: {type(exc).__name__}: {exc}",
       flush=True,
     )
+
+  if turn.interrupted.is_set():
+    # The interrupted transcript is the client's playback-flush signal. Send
+    # it before waiting, while cleanup still gates reuse of the TTS generator.
+    await asyncio.to_thread(turn.wait_for_cleanup)
 
   session.assistant_turn_finished(completed)
 

@@ -7,7 +7,7 @@ import json
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import TracebackType
@@ -22,7 +22,12 @@ from websockets.sync.client import connect
 from websockets.sync.server import ServerConnection, serve
 
 from sleeper import client, llm, server, tts
-from sleeper.conversation import ConversationSession, QueuedTurn, send_transcript, turn_loop
+from sleeper.conversation import (
+  ConversationSession,
+  QueuedTurn,
+  send_transcript,
+  turn_loop,
+)
 from sleeper.messages import SAY_ADAPTER, TURN_TRANSCRIPT_ADAPTER, Say, TurnTranscript
 from sleeper.playback import PlaybackTracker
 from sleeper.tts import EndOfTurn, SayJob, SpeakWord
@@ -382,6 +387,93 @@ def test_turn_loop_streams_response_to_speech(capsys):
   assert isinstance(session._tts._jobs.get_nowait(), SpeakWord)
   assert isinstance(session._tts._jobs.get_nowait(), EndOfTurn)
   assert len(connection.sent) == 1
+
+
+def test_interrupted_transcript_precedes_tts_cleanup():
+  transcript_sent = threading.Event()
+
+  class FakeConnection:
+    def __init__(self) -> None:
+      self.sent: list[str | bytes] = []
+
+    def send(self, message: str | bytes) -> None:
+      self.sent.append(message)
+      transcript_sent.set()
+
+  class BlockingTTS:
+    cleanup_done: threading.Event | None = None
+
+    def speak_word(self, target: FakeConnection, text: str) -> None:
+      raise AssertionError("interrupted speech must not be queued")
+
+    def end_turn(self, done: threading.Event) -> None:
+      self.cleanup_done = done
+
+  class InterruptedPlayback:
+    def reset_turn(self) -> None:
+      pass
+
+    def wake_waiters(self) -> None:
+      pass
+
+    def wait_until_complete(
+      self,
+      turn_done: threading.Event,
+      interrupted: threading.Event,
+      stopping: threading.Event,
+    ) -> bool:
+      assert interrupted.is_set()
+      return False
+
+    def heard_text(self) -> str:
+      return "cut off"
+
+  connection = FakeConnection()
+  tts_worker = BlockingTTS()
+  session = ConversationSession(playback=InterruptedPlayback(), _tts=tts_worker)
+  assert session.try_connect(connection)
+
+  class FakeStreamResult:
+    async def stream_text(self, *, delta: bool) -> AsyncIterator[str]:
+      assert delta
+      session.barge_in()
+      yield "ignored"
+
+  class FakeRunStream:
+    async def __aenter__(self) -> FakeStreamResult:
+      return FakeStreamResult()
+
+    async def __aexit__(
+      self,
+      exc_type: type[BaseException] | None,
+      exc: BaseException | None,
+      traceback: TracebackType | None,
+    ) -> bool:
+      return False
+
+  class FakeAgent:
+    def run_stream(self, prompt: str, *, message_history: list[object]) -> FakeRunStream:
+      return FakeRunStream()
+
+  async def run_scenario() -> None:
+    turns: queue.Queue = queue.Queue()
+    turns.put(QueuedTurn(connection, "Stop talking"))
+    turns.put(None)
+    task = asyncio.create_task(turn_loop(FakeAgent(), turns, session, threading.Event()))
+
+    await asyncio.wait_for(asyncio.to_thread(transcript_sent.wait), timeout=1)
+    cleanup_done = tts_worker.cleanup_done
+    assert cleanup_done is not None
+    try:
+      assert not cleanup_done.is_set()
+      assert not task.done()
+      transcript = TURN_TRANSCRIPT_ADAPTER.validate_json(connection.sent[0])
+      assert transcript == TurnTranscript("assistant", "cut off", "interrupted")
+    finally:
+      cleanup_done.set()
+      await asyncio.wait_for(task, timeout=1)
+
+  asyncio.run(run_scenario())
 
 
 def test_turn_loop_survives_failed_stream_and_reclaims_mic(capsys):
