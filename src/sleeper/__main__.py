@@ -7,8 +7,10 @@ import threading
 from contextlib import suppress
 
 import numpy as np
+from langfuse import get_client
 from moshi.models.loaders import CheckpointInfo
 from moshi.models.tts import DEFAULT_DSM_TTS_REPO, TTSModel
+from pydantic_ai import Agent
 from websockets.sync.server import serve
 
 from sleeper import server
@@ -20,6 +22,9 @@ PORT = 17393
 
 
 def main() -> None:
+  get_client()
+  Agent.instrument_all()
+
   mic_frames: queue.Queue[np.ndarray] = queue.Queue()
   turns: queue.Queue[TurnQueueItem] = queue.Queue()
 

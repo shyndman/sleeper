@@ -8,6 +8,7 @@ authors = [{ name = "Scott Hyndman", email = "scotty.hyndman@gmail.com" }]
 # Kyutai TTS (moshi) pulls sentencepiece 0.2.0, which has no cp313 wheel and
 # fails to source-build; pin to 3.12 so uv always resolves a wheel.
 dependencies = [
+  "langfuse>=4.14.0",
   "moshi==0.2.11",
   "nemo-toolkit[asr]>=2.6.2",
   "onnxruntime>=1.27.0",
