@@ -13,6 +13,7 @@ from pydantic_ai.messages import (
   ModelMessage,
   ModelRequest,
   ModelResponse,
+  SystemPromptPart,
   TextPart,
   UserPromptPart,
 )
@@ -254,13 +255,28 @@ async def _run_turn(
   history.extend(
     [
       ModelRequest(parts=[UserPromptPart(content=item.prompt)]),
-      ModelResponse(parts=[TextPart(content=spoken or "(interrupted by user)")]),
+      ModelResponse(parts=[TextPart(content=spoken)]),
     ]
   )
-  ended_by = "completed" if completed else "interrupted"
+  if not completed:
+    # Barge-in cut the reply short: the recorded response is only what was
+    # actually spoken. Follow it with a system-authored notice so later turns
+    # know the assistant was interrupted mid-sentence rather than choosing to
+    # stop there. The XML sentinel marks it as system context, not user speech.
+    history.append(
+      ModelRequest(
+        parts=[
+          SystemPromptPart(
+            content="<system-reminder>User interrupted your previous reply.</system-reminder>"
+          )
+        ]
+      )
+    )
 
   try:
-    send_transcript(ws, TurnTranscript("assistant", spoken, ended_by))
+    send_transcript(
+      ws, TurnTranscript("assistant", spoken, "completed" if completed else "interrupted")
+    )
   except ConnectionClosedOK:
     print(
       "[conversation] client disconnected before transcript",
