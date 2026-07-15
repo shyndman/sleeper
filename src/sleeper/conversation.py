@@ -2,255 +2,250 @@
 
 import asyncio
 import queue
-import re
 import threading
-import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
-    ModelMessage,
-    ModelRequest,
-    ModelResponse,
-    TextPart,
-    UserPromptPart,
+  ModelMessage,
+  ModelRequest,
+  ModelResponse,
+  TextPart,
+  UserPromptPart,
 )
 from websockets.exceptions import ConnectionClosedOK
 from websockets.sync.server import ServerConnection
 
 from sleeper.messages import TURN_TRANSCRIPT_ADAPTER, TurnTranscript
 from sleeper.playback import PlaybackTracker
-from sleeper.tts import EndOfTurn, SpeakWord, SpeechQueueItem
+from sleeper.text import iter_words
+from sleeper.tts import TTS
 
-# Words are flushed to TTS the moment they're whitespace-terminated; the
-# partial tail stays buffered until the next delta completes it.
-WORD_BREAK = re.compile(r"\s+")
+if TYPE_CHECKING:
+  from moshi.models.tts import TTSModel
 
-# A turn owns its destination connection: the socket the assistant reply is
-# spoken to plus the recognized user prompt that triggered it.
-type Turn = tuple[ServerConnection, str]
-type TurnQueueItem = Turn | None
+type TurnQueueItem = str | None
+
+
+@dataclass(slots=True)
+class AssistantTurn:
+  """The speech, interruption, and playback lifecycle of one assistant reply."""
+
+  _tts: TTS
+  _playback: PlaybackTracker
+  interrupted: threading.Event
+  _done: threading.Event = field(default_factory=threading.Event)
+
+  def speak(self, word: str) -> None:
+    self._tts.speak_word(word)
+
+  def end(self) -> None:
+    """Close generated speech; TTS signals `_done` after flushing or aborting."""
+    self._tts.end_turn(self._done)
+
+  def wait(self, stopping: threading.Event) -> tuple[bool, str]:
+    """Wait for audible playback and any interrupted TTS cleanup to finish."""
+    completed = self._playback.wait_until_complete(self._done, self.interrupted, stopping)
+    if self.interrupted.is_set():
+      self._done.wait()
+    return completed, self._playback.heard_text()
 
 
 @dataclass(slots=True)
 class ConversationSession:
-    """Single-owner conversation state: connection, phase, and interruption.
+  """Single-owner conversation state: connection, phase, and interruption.
 
-    Exactly one `/conversation` socket owns the session at a time; ownership is
-    held by `_connection_guard` and only released by `disconnect()` after a
-    successful `try_connect()`. Phase (`user`/`assistant`) and the interruption
-    signal are the turn-taking state machine: user speech, barge-in, and
-    assistant completion each move phase and toggle interruption as one
-    state-locked transition so the TTS and turn loops observe a consistent view.
+  Exactly one `/conversation` socket owns the session at a time; ownership is
+  held by `_connection_guard` and only released by `disconnect()` after a
+  successful `try_connect()`. Phase (`user`/`assistant`) and the interruption
+  signal are the turn-taking state machine: user speech, barge-in, and
+  assistant completion each move phase and toggle interruption as one
+  state-locked transition so the TTS and turn loops observe a consistent view.
+  """
+
+  playback: PlaybackTracker = field(default_factory=PlaybackTracker)
+  _tts: TTS = field(default_factory=TTS)
+  _connection_guard: threading.Lock = field(default_factory=threading.Lock)
+  _state_guard: threading.Lock = field(default_factory=threading.Lock)
+  _connection: ServerConnection | None = None
+  _phase: Literal["user", "assistant"] = "user"
+  _interrupted: threading.Event = field(default_factory=threading.Event)
+
+  def try_connect(self, ws: ServerConnection) -> bool:
+    """Acquire ownership non-blockingly, then publish the connection."""
+    if not self._connection_guard.acquire(blocking=False):
+      return False
+    with self._state_guard:
+      self._connection = ws
+      self._phase = "user"
+    return True
+
+  def disconnect(self) -> None:
+    """Interrupt, clear the connection, and release ownership.
+
+    Only valid after a successful `try_connect()`; never used for shutdown.
     """
+    with self._state_guard:
+      self._interrupted.set()
+      self._connection = None
+    self.playback.wake_waiters()
+    self._connection_guard.release()
 
-    _connection_guard: threading.Lock = field(default_factory=threading.Lock)
-    _state_guard: threading.Lock = field(default_factory=threading.Lock)
-    _connection: ServerConnection | None = None
-    _phase: Literal["user", "assistant"] = "user"
-    _interrupted: threading.Event = field(default_factory=threading.Event)
+  def active_connection(self) -> ServerConnection | None:
+    with self._state_guard:
+      return self._connection
 
-    def try_connect(self, ws: ServerConnection) -> bool:
-        """Acquire ownership non-blockingly, then publish the connection."""
-        if not self._connection_guard.acquire(blocking=False):
-            return False
-        with self._state_guard:
-            self._connection = ws
-            self._phase = "user"
-        return True
+  def is_assistant(self) -> bool:
+    with self._state_guard:
+      return self._phase == "assistant"
 
-    def disconnect(self) -> None:
-        """Interrupt, clear the connection, and release ownership.
+  def user_turn_finished(self) -> None:
+    """User turn recognized: hand off to the assistant, keep interruption."""
+    with self._state_guard:
+      self._phase = "assistant"
 
-        Only valid after a successful `try_connect()`; never used for shutdown.
-        """
-        with self._state_guard:
-            self._interrupted.set()
-            self._connection = None
-        self._connection_guard.release()
+  def assistant_turn_started(self) -> AssistantTurn:
+    """Begin and return the complete speech lifecycle for one assistant reply."""
+    with self._state_guard:
+      self._phase = "assistant"
+      self._interrupted.clear()
+      self.playback.reset_turn()
+      return AssistantTurn(self._tts, self.playback, self._interrupted)
 
-    def active_connection(self) -> ServerConnection | None:
-        with self._state_guard:
-            return self._connection
+  def assistant_turn_finished(self, completed: bool) -> None:
+    """End an assistant turn: return to user only if it completed."""
+    with self._state_guard:
+      if completed:
+        self._phase = "user"
+      self._interrupted.clear()
 
-    def is_assistant(self) -> bool:
-        with self._state_guard:
-            return self._phase == "assistant"
+  def barge_in(self) -> None:
+    """User interrupted the assistant: interrupt and reclaim the mic."""
+    with self._state_guard:
+      self._interrupted.set()
+      self._phase = "user"
+    self.playback.wake_waiters()
 
-    def user_turn_finished(self) -> None:
-        """User turn recognized: hand off to the assistant, keep interruption."""
-        with self._state_guard:
-            self._phase = "assistant"
+  def return_to_user(self) -> None:
+    """Fall back to the user phase without touching interruption."""
+    with self._state_guard:
+      self._phase = "user"
 
-    def assistant_turn_started(self) -> threading.Event:
-        """Begin an assistant turn and return its cleared interruption event."""
-        with self._state_guard:
-            self._phase = "assistant"
-            self._interrupted.clear()
-            return self._interrupted
+  def interrupt(self) -> None:
+    """Set interruption and wake playback waiters."""
+    with self._state_guard:
+      self._interrupted.set()
+    self.playback.wake_waiters()
 
-    def assistant_turn_finished(self, completed: bool) -> None:
-        """End an assistant turn: return to user only if it completed."""
-        with self._state_guard:
-            if completed:
-                self._phase = "user"
-            self._interrupted.clear()
+  def say(self, ws: ServerConnection, voice: str | None, text: str) -> None:
+    """Speak one isolated `/say` request outside the conversation lifecycle."""
+    self._tts.say(ws, voice, text)
 
-    def barge_in(self) -> None:
-        """User interrupted the assistant: interrupt and reclaim the mic."""
-        with self._state_guard:
-            self._interrupted.set()
-            self._phase = "user"
+  def run_tts(
+    self,
+    tts_model: "TTSModel",
+    stopping: threading.Event,
+    ready_message: str,
+  ) -> None:
+    self._tts.run(tts_model, self, stopping, ready_message)
 
-    def return_to_user(self) -> None:
-        """Fall back to the user phase without touching interruption."""
-        with self._state_guard:
-            self._phase = "user"
+  def stop(self) -> None:
+    """Wake every session worker and stop accepting queued speech."""
+    self.interrupt()
+    self._tts.stop()
 
-    def interrupt(self) -> None:
-        """Set interruption only; used for process shutdown."""
-        with self._state_guard:
-            self._interrupted.set()
-
-    @property
-    def interrupted(self) -> threading.Event:
-        """Stable interruption event for TTS and turn-loop checks."""
-        return self._interrupted
+  @property
+  def interrupted(self) -> threading.Event:
+    """Stable interruption event for TTS and turn-loop checks."""
+    return self._interrupted
 
 
 def send_transcript(ws: ServerConnection, transcript: TurnTranscript) -> None:
-    ws.send(TURN_TRANSCRIPT_ADAPTER.dump_json(transcript).decode())
+  ws.send(TURN_TRANSCRIPT_ADAPTER.dump_json(transcript).decode())
+
+
+async def _prompt_agent(
+  agent: Agent[None, str],
+  prompt: str,
+  history: list[ModelMessage],
+) -> AsyncIterator[str]:
+  """Stream an assistant response into word-sized speech jobs.
+
+  Complete words are queued as soon as they arrive so playback can begin while
+  the model is still responding. The final partial word is queued unless the
+  user interrupted the turn.
+  """
+  print(f"[llm] request prompt={prompt!r}", flush=True)
+  async with agent.run_stream(prompt, message_history=history) as result:
+    # This would be better as `async yield from`, but alas, not yet a thing
+    async for word in iter_words(result.stream_text(delta=True)):
+      yield word
 
 
 async def _run_turn(
-    agent: Agent,
-    turn: Turn,
-    history: list[ModelMessage],
-    speech_jobs: queue.Queue[SpeechQueueItem],
-    session: ConversationSession,
-    playback: PlaybackTracker,
-    stopping: threading.Event,
-    default_voice: str,
+  agent: Agent[None, str],
+  prompt: str,
+  history: list[ModelMessage],
+  session: ConversationSession,
+  stopping: threading.Event,
 ) -> None:
-    ws, prompt = turn
+  ws = session.active_connection()
+  if ws is None:
+    session.return_to_user()
+    return
 
-    interrupted = session.assistant_turn_started()
-    playback.reset_turn()
+  turn = session.assistant_turn_started()
 
-    turn_done = threading.Event()
-    buffer = ""
-    started_at = time.perf_counter()
-    first_response_at: float | None = None
-    received_chars = 0
-    queued_words = 0
-    stream_succeeded = False
+  async for word in _prompt_agent(agent, prompt, history):
+    if turn.interrupted.is_set():
+      break
+    turn.speak(word)
+  turn.end()
 
-    print(f"[llm] request prompt={prompt!r}", flush=True)
-    try:
-        async with agent.run_stream(prompt, message_history=history) as result:
-            async for delta in result.stream_text(delta=True):
-                received_chars += len(delta)
+  completed, spoken = await asyncio.to_thread(turn.wait, stopping)
+  history.extend(
+    [
+      ModelRequest(parts=[UserPromptPart(content=prompt)]),
+      ModelResponse(parts=[TextPart(content=spoken or "(interrupted by user)")]),
+    ]
+  )
+  ended_by = "completed" if completed else "interrupted"
 
-                if delta and first_response_at is None:
-                    first_response_at = time.perf_counter()
-                    print(
-                        f"[llm] first response "
-                        f"{first_response_at - started_at:.2f}s",
-                        flush=True,
-                    )
-
-                if interrupted.is_set():
-                    break
-
-                buffer += delta
-                *words, buffer = WORD_BREAK.split(buffer)
-                for word in words:
-                    if word:
-                        speech_jobs.put(SpeakWord(ws, default_voice, word))
-                        queued_words += 1
-        stream_succeeded = True
-    except Exception as exc:
-        elapsed = time.perf_counter() - started_at
-        print(
-            f"[llm error] {elapsed:.2f}s {type(exc).__name__}: {exc}",
-            flush=True,
-        )
-
-    tail = buffer.strip()
-    if tail and not interrupted.is_set():
-        speech_jobs.put(SpeakWord(ws, default_voice, tail))
-        queued_words += 1
-
-    if stream_succeeded:
-        elapsed = time.perf_counter() - started_at
-        outcome = "interrupted" if interrupted.is_set() else "complete"
-        print(
-            f"[llm] {outcome} {elapsed:.2f}s "
-            f"chars={received_chars} words={queued_words}",
-            flush=True,
-        )
-
-    # EndOfTurn drains the generator's delay tail (or aborts it after a
-    # barge-in) and fires `turn_done` once the worker is finished here.
-    speech_jobs.put(EndOfTurn(turn_done))
-    completed = await asyncio.to_thread(
-        playback.wait_until_complete, turn_done, interrupted, stopping
+  try:
+    send_transcript(ws, TurnTranscript("assistant", spoken, ended_by))
+  except ConnectionClosedOK:
+    print(
+      "[conversation] client disconnected before transcript",
+      flush=True,
     )
-    spoken = playback.heard_text()
-    ended_by = "completed" if completed else "interrupted"
-
-    try:
-        send_transcript(ws, TurnTranscript("assistant", spoken, ended_by))
-    except ConnectionClosedOK:
-        print(
-            "[conversation] client disconnected before transcript",
-            flush=True,
-        )
-    except Exception as exc:
-        print(
-            f"[conversation] transcript send failed: "
-            f"{type(exc).__name__}: {exc}",
-            flush=True,
-        )
-
-    if interrupted.is_set():
-        # The worker may still be skipping queued words; don't start the
-        # next turn until it has processed this turn's EndOfTurn.
-        await asyncio.to_thread(turn_done.wait)
-
-    history.append(ModelRequest(parts=[UserPromptPart(content=prompt)]))
-    history.append(
-        ModelResponse(
-            parts=[TextPart(content=spoken or "(cut off before speaking)")]
-        )
+  except Exception as exc:
+    print(
+      f"[conversation] transcript send failed: {type(exc).__name__}: {exc}",
+      flush=True,
     )
 
-    session.assistant_turn_finished(completed)
+  session.assistant_turn_finished(completed)
 
 
 async def turn_loop(
-    agent: Agent,
-    turns: queue.Queue[TurnQueueItem],
-    speech_jobs: queue.Queue[SpeechQueueItem],
-    session: ConversationSession,
-    playback: PlaybackTracker,
-    stopping: threading.Event,
-    default_voice: str,
+  agent: Agent[None, str],
+  turns: queue.Queue[TurnQueueItem],
+  session: ConversationSession,
+  stopping: threading.Event,
 ) -> None:
-    history: list[ModelMessage] = []
+  history: list[ModelMessage] = []
 
-    while not stopping.is_set():
-        turn = await asyncio.to_thread(turns.get)
-        if turn is None:
-            return
-        await _run_turn(
-            agent,
-            turn,
-            history,
-            speech_jobs,
-            session,
-            playback,
-            stopping,
-            default_voice,
-        )
+  while not stopping.is_set():
+    turn = await asyncio.to_thread(turns.get)
+    if turn is not None:
+      await _run_turn(
+        agent,
+        turn,
+        history,
+        session,
+        stopping,
+      )
+    else:
+      return

@@ -8,15 +8,15 @@ from pydantic.dataclasses import dataclass
 
 @dataclass(config=ConfigDict(extra="forbid", frozen=True))
 class Say:
-    text: str
-    voice: str | None = None
+  text: str
+  voice: str | None = None
 
 
 @dataclass(config=ConfigDict(extra="forbid", frozen=True))
 class TurnTranscript:
-    role: Literal["user", "assistant"]
-    text: str
-    ended_by: Literal["turn_detected", "completed", "interrupted"]
+  role: Literal["user", "assistant"]
+  text: str
+  ended_by: Literal["turn_detected", "completed", "interrupted"]
 
 
 SAY_ADAPTER = TypeAdapter(Say)
