@@ -4,6 +4,7 @@ import asyncio
 import functools
 import queue
 import threading
+from concurrent.futures import Future
 from contextlib import suppress
 
 import numpy as np
@@ -38,15 +39,17 @@ def main() -> None:
   warm_llm()
   ready_message = f"[ready] ws://0.0.0.0:{PORT}/conversation and /say"
 
+  # The TTS worker warms up CUDA/model state before publishing readiness.
+  # Block here so a warmup failure unwinds main() before any service starts.
+  startup: Future[None] = Future()
   threading.Thread(
     target=session.run_tts,
-    args=(tts_model, stopping, ready_message),
+    args=(tts_model, startup, ready_message),
     daemon=True,
   ).start()
+  startup.result()
   threading.Thread(
-    target=lambda: asyncio.run(
-      turn_loop(agent, turns, session, stopping)
-    ),
+    target=lambda: asyncio.run(turn_loop(agent, turns, session, stopping)),
     daemon=True,
   ).start()
   listener = threading.Thread(

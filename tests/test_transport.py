@@ -8,9 +8,11 @@ import queue
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
+from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import TracebackType
+from typing import cast
 
 import numpy as np
 import pytest
@@ -21,6 +23,7 @@ from websockets.frames import Close
 from websockets.sync.client import connect
 from websockets.sync.server import ServerConnection, serve
 
+import sleeper.__main__ as sleeper_main
 from sleeper import client, llm, server, tts
 from sleeper.conversation import (
   ConversationSession,
@@ -633,16 +636,124 @@ def test_tts_clean_close_abandons_turn_once(monkeypatch, capsys):
   session._tts.end_turn(done)
   session._tts.stop()
 
+  startup: Future[None] = Future()
   session._tts.run(
     FakeTtsModel(),
     session,
-    threading.Event(),
+    startup,
     "[ready]",
   )
 
   output = capsys.readouterr().out
+  assert startup.done()
+  assert startup.exception() is None
   assert output.count("[tts] client disconnected; turn abandoned") == 1
   assert "[tts error]" not in output
   assert created[0].conversation_speak_calls == 1
   assert created[0].abort_calls == 1
   assert done.is_set()
+
+
+def test_main_aborts_before_serving_when_tts_warmup_fails(monkeypatch):
+  """A failed TTS warmup unwinds main() before any service accepts work."""
+  turn_loop_started = threading.Event()
+  listener_started = threading.Event()
+  serve_forever_called = threading.Event()
+
+  class FakeAgent:
+    @staticmethod
+    def instrument_all() -> None:
+      pass
+
+  class FakeCheckpointInfo:
+    @staticmethod
+    def from_hf_repo(repo: object) -> object:
+      return object()
+
+  class FakeMimi:
+    def streaming(self, batch_size: int):
+      assert batch_size == 1
+      return nullcontext()
+
+  class FakeTtsModel:
+    mimi = FakeMimi()
+
+  class FakeTTSModel:
+    @staticmethod
+    def from_checkpoint_info(ckpt: object, n_q: int, temp: float, device: str) -> object:
+      return FakeTtsModel()
+
+  class FakeSynth:
+    def __init__(self, tts_model: object, session: object) -> None:
+      pass
+
+    def set_voice(self, voice: str) -> None:
+      raise RuntimeError("CUDA warmup failed")
+
+  async def fake_turn_loop(*args: object, **kwargs: object) -> None:
+    turn_loop_started.set()
+
+  def fake_listen_worker(*args: object, **kwargs: object) -> None:
+    listener_started.set()
+
+  @contextmanager
+  def fake_serve(*args: object, **kwargs: object):
+    class FakeServer:
+      def serve_forever(self) -> None:
+        serve_forever_called.set()
+
+    yield FakeServer()
+
+  monkeypatch.setattr(sleeper_main, "get_client", lambda: None)
+  monkeypatch.setattr(sleeper_main, "Agent", FakeAgent)
+  monkeypatch.setattr(sleeper_main, "CheckpointInfo", FakeCheckpointInfo)
+  monkeypatch.setattr(sleeper_main, "TTSModel", FakeTTSModel)
+  monkeypatch.setattr(sleeper_main, "create_llm_agent", lambda: object())
+  monkeypatch.setattr(sleeper_main, "warm_llm", lambda: None)
+  monkeypatch.setattr(tts, "Synth", FakeSynth)
+  monkeypatch.setattr(sleeper_main, "turn_loop", fake_turn_loop)
+  monkeypatch.setattr(sleeper_main, "listen_worker", fake_listen_worker)
+  monkeypatch.setattr(sleeper_main, "serve", fake_serve)
+
+  with pytest.raises(RuntimeError, match="CUDA warmup failed"):
+    sleeper_main.main()
+
+  # Any erroneously-started thread would flip its marker; give them a window.
+  time.sleep(0.1)
+  assert not turn_loop_started.is_set()
+  assert not listener_started.is_set()
+  assert not serve_forever_called.is_set()
+
+
+def test_tts_stop_rejects_late_say_without_blocking():
+  """A /say arriving after shutdown fails fast instead of blocking forever."""
+  worker = tts.TTS()
+  worker.stop()
+  captured: queue.Queue[Exception] = queue.Queue()
+
+  def call_say() -> None:
+    try:
+      worker.say(cast(ServerConnection, object()), None, "hello")
+    except Exception as exc:
+      captured.put(exc)
+
+  # daemon=True so a regression that reintroduces the block cannot hang pytest.
+  thread = threading.Thread(target=call_say, daemon=True)
+  thread.start()
+  thread.join(timeout=1)
+  assert not thread.is_alive()
+  exc = captured.get_nowait()
+  assert isinstance(exc, RuntimeError)
+  assert str(exc) == "TTS worker has stopped"
+
+
+def test_tts_stop_releases_late_end_turn():
+  """A turn close arriving after shutdown signals its waiter synchronously."""
+  worker = tts.TTS()
+  worker.stop()
+  done = threading.Event()
+  worker.end_turn(done)
+  assert done.is_set()
+  # Only the sentinel is queued; no EndOfTurn was admitted after it.
+  assert worker._jobs.get_nowait() is None
+  assert worker._jobs.empty()

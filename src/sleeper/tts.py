@@ -3,6 +3,7 @@
 import queue
 import threading
 import time
+from concurrent.futures import Future
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -60,44 +61,79 @@ class TTS:
 
   def __init__(self) -> None:
     self._jobs: queue.Queue[SpeechQueueItem] = queue.Queue()
+    # Admission and termination share one lock so a job either lands ahead of
+    # the sentinel (and is guaranteed to run and signal its waiter) or is
+    # rejected outright. Without this a producer could enqueue behind the
+    # sentinel and block forever on a worker that has already exited.
+    self._lock = threading.Lock()
+    self._stopped = False
+
+  def _try_enqueue(self, job: SpeakWord | EndOfTurn | SayJob) -> bool:
+    """Admit a job to the FIFO, or refuse it once shutdown has begun."""
+    with self._lock:
+      if self._stopped:
+        return False
+      self._jobs.put(job)
+      return True
 
   def speak_word(self, target: ServerConnection, text: str) -> None:
     """Append one complete word to the current streaming assistant turn."""
-    self._jobs.put(SpeakWord(target, text))
+    # Speech dropped after shutdown is silent: there is no waiter to release.
+    self._try_enqueue(SpeakWord(target, text))
 
   def end_turn(self, done: threading.Event) -> None:
     """Flush or abort the assistant turn, then signal its waiter."""
-    self._jobs.put(EndOfTurn(done))
+    # A rejected close still must release wait_for_cleanup(), so signal here.
+    if not self._try_enqueue(EndOfTurn(done)):
+      done.set()
 
   def say(self, ws: ServerConnection, voice: str | None, text: str) -> None:
     """Speak one isolated `/say` request and block until synthesis finishes."""
     done = threading.Event()
-    self._jobs.put(SayJob(ws, voice, text, done))
+    # Fail fast instead of blocking on a worker that will never dequeue this.
+    if not self._try_enqueue(SayJob(ws, voice, text, done)):
+      raise RuntimeError("TTS worker has stopped")
     done.wait()
 
   def stop(self) -> None:
-    self._jobs.put(None)
+    with self._lock:
+      if self._stopped:
+        return
+      self._stopped = True
+      self._jobs.put(None)
 
   def run(
     self,
     tts_model: TTSModel,
     session: "ConversationSession",
-    stopping: threading.Event,
+    startup: Future[None],
     ready_message: str,
   ) -> None:
-    synth = Synth(tts_model, session)
+    try:
+      synth = Synth(tts_model, session)
+      with torch.no_grad(), tts_model.mimi.streaming(1):
+        synth.set_voice(DEFAULT_VOICE)
+        synth.speak("Warming up.")
+        synth.end_turn()
+        print(ready_message, flush=True)
+        # Readiness is published only after warmup succeeds; main() blocks on
+        # this before starting any service that could enqueue work.
+        startup.set_result(None)
 
-    with torch.no_grad(), tts_model.mimi.streaming(1):
-      synth.set_voice(DEFAULT_VOICE)
-      synth.speak("Warming up.")
-      synth.end_turn()
-      print(ready_message, flush=True)
-
-      while not stopping.is_set():
-        job = self._jobs.get()
-        if job is None:
-          return
-        _process_job(synth, job)
+        # Unconditional dequeue: every job admitted before the sentinel runs
+        # and signals its waiter before the worker exits on None.
+        while True:
+          job = self._jobs.get()
+          if job is None:
+            return
+          _process_job(synth, job)
+    except Exception as exc:
+      if not startup.done():
+        # Warmup failed before readiness: hand the fault to main() and stop.
+        startup.set_exception(exc)
+        return
+      # A fault after readiness is unexpected; stay fail-loud.
+      raise
 
 
 class Synth:
@@ -391,4 +427,3 @@ def _process_job(synth: Synth, job: SpeakWord | EndOfTurn | SayJob) -> None:
       _speak_word(synth, job)
     case SayJob():
       _say(synth, job)
-

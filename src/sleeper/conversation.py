@@ -4,6 +4,7 @@ import asyncio
 import queue
 import threading
 from collections.abc import AsyncIterator
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -191,10 +192,10 @@ class ConversationSession:
   def run_tts(
     self,
     tts_model: "TTSModel",
-    stopping: threading.Event,
+    startup: Future[None],
     ready_message: str,
   ) -> None:
-    self._tts.run(tts_model, self, stopping, ready_message)
+    self._tts.run(tts_model, self, startup, ready_message)
 
   def stop(self) -> None:
     """Wake every session worker and stop accepting queued speech."""
