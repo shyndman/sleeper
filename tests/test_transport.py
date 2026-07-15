@@ -15,6 +15,7 @@ from types import TracebackType
 import numpy as np
 import pytest
 from pydantic import ValidationError
+from pydantic_ai.exceptions import ModelAPIError
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 from websockets.frames import Close
 from websockets.sync.client import connect
@@ -381,6 +382,69 @@ def test_turn_loop_streams_response_to_speech(capsys):
   assert isinstance(session._tts._jobs.get_nowait(), SpeakWord)
   assert isinstance(session._tts._jobs.get_nowait(), EndOfTurn)
   assert len(connection.sent) == 1
+
+
+def test_turn_loop_survives_failed_stream_and_reclaims_mic(capsys):
+  """A model-stream failure abandons the turn without killing the loop.
+
+  Reproduces issue #2: an unhandled `agent.run_stream` error used to escape
+  `turn_loop`, kill the daemon thread, and strand the session in the assistant
+  phase forever. The turn is now abandoned and the mic handed back so the next
+  prompt runs the machinery again.
+  """
+
+  class FakeConnection:
+    def send(self, message: str | bytes) -> None:
+      pass
+
+  class FailingRunStream:
+    async def __aenter__(self):
+      # Mirrors "Ollama briefly unreachable when the prompt is dequeued":
+      # pydantic_ai wraps the transport failure as ModelAPIError (an
+      # AgentRunError subclass) at stream entry.
+      raise ModelAPIError(model_name="fake", message="Connection error.")
+
+    async def __aexit__(self, exc_type, exc, traceback) -> bool:
+      return False
+
+  class FailingAgent:
+    def run_stream(self, prompt: str, *, message_history: list[object]) -> FailingRunStream:
+      return FailingRunStream()
+
+  class FakePlayback:
+    def reset_turn(self) -> None:
+      pass
+
+    def wait_until_complete(
+      self,
+      turn_done: threading.Event,
+      interrupted: threading.Event,
+      stopping: threading.Event,
+    ) -> bool:
+      return True
+
+    def heard_text(self) -> str:
+      return ""
+
+  session = ConversationSession(playback=FakePlayback())
+  assert session.try_connect(FakeConnection())
+  session.user_turn_finished()
+  assert session.is_assistant()
+
+  turns: queue.Queue = queue.Queue()
+  turns.put("How are you?")
+  turns.put(None)
+
+  # turn_loop must return normally: the failure is caught, not propagated.
+  asyncio.run(turn_loop(FailingAgent(), turns, session, threading.Event()))
+
+  output = capsys.readouterr().out
+  assert "[turn error] ModelAPIError: Connection error." in output
+  # Mic reclaimed: the next user prompt can run the turn machinery again.
+  assert not session.is_assistant()
+  # The abandoned turn is drained so the TTS worker closes it.
+  assert isinstance(session._tts._jobs.get_nowait(), EndOfTurn)
+  assert session._tts._jobs.empty()
 
 
 def test_tts_clean_close_abandons_turn_once(monkeypatch, capsys):

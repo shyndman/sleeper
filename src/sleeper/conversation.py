@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import AgentRunError
 from pydantic_ai.messages import (
   ModelMessage,
   ModelRequest,
@@ -72,6 +73,9 @@ class ConversationSession:
   _connection: ServerConnection | None = None
   _phase: Literal["user", "assistant"] = "user"
   _interrupted: threading.Event = field(default_factory=threading.Event)
+  # The in-flight assistant turn, retained so a failed model stream can be
+  # abandoned from turn_loop, which never sees the turn object directly.
+  _turn: AssistantTurn | None = None
 
   def try_connect(self, ws: ServerConnection) -> bool:
     """Acquire ownership non-blockingly, then publish the connection."""
@@ -112,13 +116,34 @@ class ConversationSession:
       self._phase = "assistant"
       self._interrupted.clear()
       self.playback.reset_turn()
-      return AssistantTurn(self._tts, self.playback, self._interrupted)
+      self._turn = AssistantTurn(self._tts, self.playback, self._interrupted)
+      return self._turn
 
   def assistant_turn_finished(self, completed: bool) -> None:
     """End an assistant turn: return to user only if it completed."""
     with self._state_guard:
       if completed:
         self._phase = "user"
+      self._interrupted.clear()
+      self._turn = None
+
+  def abandon_assistant_turn(self, stopping: threading.Event) -> None:
+    """Give up on a turn whose model stream failed, then reclaim the mic.
+
+    Drains the turn's queued speech so the TTS worker closes it -- an unclosed
+    turn would bleed into the next one -- then returns to the user phase
+    unconditionally: a failed stream has no completion to honor and its words
+    are never recorded to history. The drain blocks on TTS/playback, so callers
+    run this off the event loop.
+    """
+    with self._state_guard:
+      turn = self._turn
+      self._turn = None
+    if turn is not None:
+      turn.end()
+      turn.wait(stopping)
+    with self._state_guard:
+      self._phase = "user"
       self._interrupted.clear()
 
   def barge_in(self) -> None:
@@ -238,14 +263,18 @@ async def turn_loop(
   history: list[ModelMessage] = []
 
   while not stopping.is_set():
-    turn = await asyncio.to_thread(turns.get)
-    if turn is not None:
-      await _run_turn(
-        agent,
-        turn,
-        history,
-        session,
-        stopping,
-      )
-    else:
+    prompt = await asyncio.to_thread(turns.get)
+    if prompt is None:
       return
+    try:
+      await _run_turn(agent, prompt, history, session, stopping)
+    except AgentRunError as exc:
+      # Resilience boundary: a turn's model call can fail (host unreachable) or
+      # its orchestration can give up (tool-call retries exhausted). Abandon the
+      # turn and hand the mic back so the next prompt runs the machinery again,
+      # instead of letting the error kill this daemon thread and strand the
+      # session in the assistant phase forever, deaf to everything but barge-in.
+      # Terminal tool failures (once tools land) join this net via a shared
+      # tool-error base added to the except.
+      print(f"[turn error] {type(exc).__name__}: {exc}", flush=True)
+      await asyncio.to_thread(session.abandon_assistant_turn, stopping)
