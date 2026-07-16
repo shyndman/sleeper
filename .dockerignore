@@ -1,4 +1,6 @@
 .git
+.pytest_cache
+.ruff_cache
 # .venv is never baked into the image: a baked venv is a ~7GB layer shipped
 # dozens of times a day with zero caching. The deploy target builds it at
 # startup from a bind-mounted uv cache instead (see Dockerfile CMD).
