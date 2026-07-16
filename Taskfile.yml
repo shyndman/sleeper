@@ -19,4 +19,5 @@ tasks:
         docker push {{.IMAGE}}
       # DEPLOY_DEV_PATH stays inside the single quotes so a leading ~ is
       # expanded by the remote shell, not locally.
-      - ssh {{.DEPLOY_DEV_HOST}} 'cd {{.DEPLOY_DEV_PATH}} && docker compose pull && docker compose up --detach'
+      - scp ./.env {{.DEPLOY_DEV_HOST}}:{{.DEPLOY_DEV_PATH}}
+      - kitten ssh {{.DEPLOY_DEV_HOST}} "zsh -l -c 'cd {{.DEPLOY_DEV_PATH}} && docker compose pull && op run -- docker compose up --detach sleeper && docker compose logs --follow sleeper'" 
