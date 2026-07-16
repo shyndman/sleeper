@@ -12,7 +12,7 @@ import pytest
 import sphn
 import torch
 
-from sleeper.voice_input import MIC_SR, SMART_TURN_ONNX, StreamingASR, TurnDetector
+from sleeper.asr import MIC_SR, SMART_TURN_ONNX, StreamingASR, TurnDetector
 
 AUDIO_FILE = Path(__file__).parent / "data" / "bria.mp3"
 BLOCK = 512  # same mic blocksize the live loop uses

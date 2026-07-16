@@ -29,7 +29,7 @@ from sleeper.interruption import (
 )
 from sleeper.messages import TurnTranscript
 
-_logger = get_logger("voice")
+_logger = get_logger("asr")
 
 # ---- Voice input (mic -> VAD -> {ASR + smart-turn | barge-in}) ----
 ASR_MODEL = "nvidia/nemotron-speech-streaming-en-0.6b"
@@ -61,6 +61,11 @@ class StreamingASR:
   HOP = 160  # preprocessor hop: one mel frame per 10ms at 16kHz
 
   def __init__(self) -> None:
+    # Silence their extremely noisy logs
+    from nemo.utils.nemo_logging import Logger
+    nemo_logger = Logger()
+    nemo_logger.remove_stream_handlers()
+
     import nemo.collections.asr as nemo_asr  # slow import; keep it local
 
     model = nemo_asr.models.ASRModel.from_pretrained(model_name=ASR_MODEL)

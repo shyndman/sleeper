@@ -16,9 +16,9 @@ from pydantic_ai import Agent
 from websockets.sync.server import serve
 
 from sleeper import server
+from sleeper.asr import VAD_FRAME_SAMPLES, listen_worker
 from sleeper.conversation import ConversationSession, TurnQueueItem, turn_loop
 from sleeper.llm import create_llm_agent, warm_llm
-from sleeper.voice_input import VAD_FRAME_SAMPLES, listen_worker
 
 PORT = 17393
 
