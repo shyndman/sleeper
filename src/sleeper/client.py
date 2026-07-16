@@ -89,25 +89,31 @@ async def _run(url: str) -> None:
     except queue.Empty:
       outdata[:] = SILENCE
 
-  with (
-    sd.RawInputStream(
-      samplerate=16_000,
-      blocksize=INPUT_SAMPLES,
-      channels=1,
-      dtype="int16",
-      callback=capture,
-    ),
-    sd.RawOutputStream(
-      samplerate=24_000,
-      blocksize=OUTPUT_SAMPLES,
-      channels=1,
-      dtype="int16",
-      callback=play,
-    ),
-  ):
+  with contextlib.ExitStack() as streams:
+    streams.enter_context(
+      sd.RawInputStream(
+        samplerate=16_000,
+        blocksize=INPUT_SAMPLES,
+        channels=1,
+        dtype="int16",
+        callback=capture,
+      )
+    )
+    _logger.info("microphone acquired")
+    streams.enter_context(
+      sd.RawOutputStream(
+        samplerate=24_000,
+        blocksize=OUTPUT_SAMPLES,
+        channels=1,
+        dtype="int16",
+        callback=play,
+      )
+    )
     while True:
       try:
+        _logger.info("connecting", url=url)
         async with connect(url, compression=None) as websocket:
+          _logger.info("connected", url=url)
           sender = asyncio.create_task(_send_mic(websocket, microphone))
           receiver = asyncio.create_task(_receive(websocket, playback))
           done, pending = await asyncio.wait(
