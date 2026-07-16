@@ -36,22 +36,31 @@ def main() -> None:
   session = ConversationSession()
   stopping = threading.Event()
 
-  _logger.info("loading TTS model")
-  ckpt = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
-  tts_model = TTSModel.from_checkpoint_info(ckpt, n_q=32, temp=0.6, device="cuda")
-  agent = create_llm_agent()
-  warm_llm()
-  ready_message = f"ws://0.0.0.0:{PORT}/conversation and /say"
+  # Model load, LLM warmup, and TTS/CUDA warmup all reach over the network or to
+  # the GPU and can fail fatally before any service is up. Route the failure
+  # through libsh so the traceback renders in the structured format, then exit
+  # non-zero so the container reports the crash instead of dumping a raw trace.
+  try:
+    _logger.info("loading TTS model")
+    ckpt = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
+    tts_model = TTSModel.from_checkpoint_info(ckpt, n_q=32, temp=0.6, device="cuda")
+    agent = create_llm_agent()
+    warm_llm()
+    ready_message = f"ws://0.0.0.0:{PORT}/conversation and /say"
 
-  # The TTS worker warms up CUDA/model state before publishing readiness.
-  # Block here so a warmup failure unwinds main() before any service starts.
-  startup: Future[None] = Future()
-  threading.Thread(
-    target=session.run_tts,
-    args=(tts_model, startup, ready_message),
-    daemon=True,
-  ).start()
-  startup.result()
+    # The TTS worker warms up CUDA/model state before publishing readiness.
+    # Block here so a warmup failure unwinds main() before any service starts.
+    startup: Future[None] = Future()
+    threading.Thread(
+      target=session.run_tts,
+      args=(tts_model, startup, ready_message),
+      daemon=True,
+    ).start()
+    startup.result()
+  except Exception:
+    _logger.exception("startup failed")
+    raise SystemExit(1) from None
+
   threading.Thread(
     target=lambda: asyncio.run(turn_loop(agent, turns, session, stopping)),
     daemon=True,

@@ -722,8 +722,9 @@ def test_main_aborts_before_serving_when_tts_warmup_fails(monkeypatch):
   monkeypatch.setattr(sleeper_main, "listen_worker", fake_listen_worker)
   monkeypatch.setattr(sleeper_main, "serve", fake_serve)
 
-  with pytest.raises(RuntimeError, match="CUDA warmup failed"):
+  with pytest.raises(SystemExit) as excinfo:
     sleeper_main.main()
+  assert excinfo.value.code == 1
 
   # Any erroneously-started thread would flip its marker; give them a window.
   time.sleep(0.1)
