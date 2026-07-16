@@ -8,6 +8,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+from libsh import get_logger
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import AgentRunError
 from pydantic_ai.messages import (
@@ -25,6 +26,8 @@ from sleeper.messages import TURN_TRANSCRIPT_ADAPTER, TurnTranscript
 from sleeper.playback import PlaybackTracker
 from sleeper.text import iter_words
 from sleeper.tts import TTS
+
+_logger = get_logger("conv")
 
 if TYPE_CHECKING:
   from moshi.models.tts import TTSModel
@@ -223,7 +226,7 @@ async def _prompt_agent(
   the model is still responding. The final partial word is queued unless the
   user interrupted the turn.
   """
-  print(f"[llm] request prompt={prompt!r}", flush=True)
+  _logger.info("llm request", prompt=prompt)
   async with agent.run_stream(prompt, message_history=history) as result:
     # This would be better as `async yield from`, but alas, not yet a thing
     async for word in iter_words(result.stream_text(delta=True)):
@@ -279,15 +282,9 @@ async def _run_turn(
       ws, TurnTranscript("assistant", spoken, "completed" if completed else "interrupted")
     )
   except ConnectionClosedOK:
-    print(
-      "[conversation] client disconnected before transcript",
-      flush=True,
-    )
-  except Exception as exc:
-    print(
-      f"[conversation] transcript send failed: {type(exc).__name__}: {exc}",
-      flush=True,
-    )
+    _logger.info("client disconnected before transcript")
+  except Exception:
+    _logger.exception("transcript send failed")
 
   if turn.interrupted.is_set():
     # The interrupted transcript is the client's playback-flush signal. Send
@@ -311,7 +308,7 @@ async def turn_loop(
       return
     try:
       await _run_turn(agent, item, history, session, stopping)
-    except AgentRunError as exc:
+    except AgentRunError:
       # Resilience boundary: a turn's model call can fail (host unreachable) or
       # its orchestration can give up (tool-call retries exhausted). Abandon the
       # turn and hand the mic back so the next prompt runs the machinery again,
@@ -319,5 +316,5 @@ async def turn_loop(
       # session in the assistant phase forever, deaf to everything but barge-in.
       # Terminal tool failures (once tools land) join this net via a shared
       # tool-error base added to the except.
-      print(f"[turn error] {type(exc).__name__}: {exc}", flush=True)
+      _logger.exception("turn error")
       await asyncio.to_thread(session.abandon_assistant_turn, stopping)

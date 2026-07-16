@@ -6,7 +6,7 @@ import contextlib
 import queue
 
 import sounddevice as sd
-from libsh import setup_logging_from_env
+from libsh import get_logger, setup_logging_from_env
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
@@ -18,6 +18,8 @@ OUTPUT_SAMPLES = 1920
 OUTPUT_BYTES = OUTPUT_SAMPLES * 2
 SILENCE = bytes(OUTPUT_BYTES)
 DEFAULT_URL = "ws://127.0.0.1:17393/conversation"
+
+_logger = get_logger("client")
 
 
 async def _send_mic(websocket: ClientConnection, microphone: queue.Queue[bytes]) -> None:
@@ -48,7 +50,12 @@ async def _receive(websocket: ClientConnection, playback: queue.SimpleQueue[byte
       continue
 
     transcript = TURN_TRANSCRIPT_ADAPTER.validate_json(message)
-    print(f"{transcript.role}: {transcript.text} [{transcript.ended_by}]", flush=True)
+    _logger.info(
+      "transcript",
+      role=transcript.role,
+      text=transcript.text,
+      ended_by=transcript.ended_by,
+    )
     if transcript.role == "assistant" and transcript.ended_by == "interrupted":
       _flush(playback)
 
@@ -112,8 +119,8 @@ async def _run(url: str) -> None:
           for task in done:
             task.result()
 
-      except (OSError, ConnectionClosed, TimeoutError) as error:
-        print(f"connection lost ({error}); retrying", flush=True)
+      except (OSError, ConnectionClosed, TimeoutError):
+        _logger.exception("connection lost; retrying")
 
       _flush(microphone)
       _flush(playback)

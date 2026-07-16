@@ -67,6 +67,3 @@ select = [
   # isort
   "I",
 ]
-
-[tool.uv.sources]
-libsh = { path = "../../libsh", editable = true }

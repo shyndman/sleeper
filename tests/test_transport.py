@@ -319,7 +319,11 @@ def test_client_flushes_queued_playback_on_interrupted_assistant_transcript(caps
   playback = queue.SimpleQueue()
   asyncio.run(client._receive(Messages(), playback))
   assert playback.empty()
-  assert "assistant: cut off [interrupted]" in capsys.readouterr().out
+  output = capsys.readouterr().out
+  assert "transcript" in output
+  assert "role=assistant" in output
+  assert "text='cut off'" in output
+  assert "ended_by=interrupted" in output
 
 
 def test_turn_loop_streams_response_to_speech(capsys):
@@ -385,7 +389,8 @@ def test_turn_loop_streams_response_to_speech(capsys):
   )
 
   output = capsys.readouterr().out
-  assert "[llm] request prompt='How are you?'" in output
+  assert "llm request" in output
+  assert "prompt='How are you?'" in output
   assert isinstance(session._tts._jobs.get_nowait(), SpeakWord)
   assert isinstance(session._tts._jobs.get_nowait(), SpeakWord)
   assert isinstance(session._tts._jobs.get_nowait(), EndOfTurn)
@@ -535,7 +540,9 @@ def test_turn_loop_survives_failed_stream_and_reclaims_mic(capsys):
   asyncio.run(turn_loop(FailingAgent(), turns, session, threading.Event()))
 
   output = capsys.readouterr().out
-  assert "[turn error] ModelAPIError: Connection error." in output
+  assert "turn error" in output
+  assert "ModelAPIError" in output
+  assert "Connection error." in output
   # Mic reclaimed: the next user prompt can run the turn machinery again.
   assert not session.is_assistant()
   # The abandoned turn is drained so the TTS worker closes it.
@@ -647,8 +654,8 @@ def test_tts_clean_close_abandons_turn_once(monkeypatch, capsys):
   output = capsys.readouterr().out
   assert startup.done()
   assert startup.exception() is None
-  assert output.count("[tts] client disconnected; turn abandoned") == 1
-  assert "[tts error]" not in output
+  assert output.count("client disconnected; turn abandoned") == 1
+  assert "Traceback" not in output
   assert created[0].conversation_speak_calls == 1
   assert created[0].abort_calls == 1
   assert done.is_set()

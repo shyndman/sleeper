@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from libsh import get_logger
 from moshi.conditioners import ConditionAttributes, dropout_all_conditions
 from moshi.models.lm import LMGen
 from moshi.models.tts import TTSModel, script_to_entries
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
   from sleeper.conversation import ConversationSession
 
 DEFAULT_VOICE = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
+
+_logger = get_logger("tts")
 
 # One resident synth serves two producers. A conversation turn streams in as
 # individual SpeakWord jobs -- words are fed to the generator as the LLM emits
@@ -115,7 +118,7 @@ class TTS:
         synth.set_voice(DEFAULT_VOICE)
         synth.speak("Warming up.")
         synth.end_turn()
-        print(ready_message, flush=True)
+        _logger.info("ready", endpoints=ready_message)
         # Readiness is published only after warmup succeeds; main() blocks on
         # this before starting any service that could enqueue work.
         startup.set_result(None)
@@ -280,7 +283,7 @@ class Synth:
     self.voice = voice
     self.first_turn = True
 
-    print(f"[voice] {voice}")
+    _logger.info("voice set", voice=voice)
 
   def speak(self, text: str) -> None:
     assert self.lm_gen is not None, "set_voice must run before speak"
@@ -340,13 +343,13 @@ def _abandon_turn(synth: Synth, exc: Exception) -> None:
     time.perf_counter() - synth.turn_started_at if synth.turn_started_at is not None else 0.0
   )
   if isinstance(exc, ConnectionClosedOK):
-    print(f"[tts] client disconnected; turn abandoned {elapsed:.2f}s", flush=True)
+    _logger.info("client disconnected; turn abandoned", elapsed=elapsed)
   else:
-    print(f"[tts error] {elapsed:.2f}s {type(exc).__name__}: {exc}", flush=True)
+    _logger.exception("turn abandoned", exc_info=exc, elapsed=elapsed)
   try:
     synth.abort_turn()
-  except Exception as reset_exc:
-    print(f"[tts reset error] {type(reset_exc).__name__}: {reset_exc}", flush=True)
+  except Exception:
+    _logger.exception("turn reset failed")
   synth.target = None
   synth.turn_open = False
   synth.turn_failed = True
@@ -364,7 +367,7 @@ def _close_turn(synth: Synth) -> None:
     assert synth.turn_started_at is not None
     elapsed = time.perf_counter() - synth.turn_started_at
     outcome = "interrupted" if interrupted else "complete"
-    print(f"[tts] turn {outcome} {elapsed:.2f}s", flush=True)
+    _logger.info("turn finished", outcome=outcome, elapsed=elapsed)
   except Exception as exc:
     # A failed drain leaves the machine mid-sequence; abort to a clean state.
     _abandon_turn(synth, exc)
@@ -386,7 +389,7 @@ def _speak_word(synth: Synth, job: SpeakWord) -> None:
       synth.conversation_audio = True
       synth.turn_open = True
       synth.turn_started_at = time.perf_counter()
-      print(f"[tts] turn started voice={DEFAULT_VOICE!r}", flush=True)
+      _logger.info("turn started", voice=DEFAULT_VOICE)
     synth.speak(job.text)
     synth.session.playback.mark_spoken(job.text)
   except Exception as exc:
@@ -400,18 +403,18 @@ def _say(synth: Synth, job: SayJob) -> None:
   synth.conversation_audio = False
   voice = job.voice or DEFAULT_VOICE
   started_at = time.perf_counter()
-  print(f"[tts] say started voice={voice!r} chars={len(job.text)}", flush=True)
+  _logger.info("say started", voice=voice, chars=len(job.text))
 
   try:
     synth.set_voice(voice)
     synth.speak(job.text)
     synth.end_turn()
-    print(f"[tts] say complete {time.perf_counter() - started_at:.2f}s", flush=True)
+    _logger.info("say complete", elapsed=time.perf_counter() - started_at)
   except ConnectionClosedOK:
-    print("[tts] say client disconnected", flush=True)
+    _logger.info("say client disconnected")
     synth.abort_turn()
-  except Exception as exc:
-    print(f"[tts error] say {type(exc).__name__}: {exc}", flush=True)
+  except Exception:
+    _logger.exception("say failed")
     synth.abort_turn()
   finally:
     synth.target = None

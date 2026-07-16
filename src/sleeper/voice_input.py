@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 import torch
+from libsh import get_logger
 from omegaconf import open_dict
 
 from sleeper.conversation import ConversationSession, QueuedTurn, TurnQueueItem, send_transcript
@@ -27,6 +28,8 @@ from sleeper.interruption import (
   SpeechGate,
 )
 from sleeper.messages import TurnTranscript
+
+_logger = get_logger("voice")
 
 # ---- Voice input (mic -> VAD -> {ASR + smart-turn | barge-in}) ----
 ASR_MODEL = "nvidia/nemotron-speech-streaming-en-0.6b"
@@ -179,7 +182,7 @@ def listen_worker(
   """Consume 512-sample remote mic frames; own all voice-input models."""
   from silero_vad import load_silero_vad
 
-  print("Loading voice input models (VAD / barge-in / smart-turn / ASR)...")
+  _logger.info("loading voice input models")
 
   vad = load_silero_vad()
   vad.reset_states()
@@ -221,7 +224,7 @@ def listen_worker(
     if session.is_assistant():
       capturing = False
       if speaking and bargein.probability(window) >= bargein.threshold:
-        print("[barge-in]")
+        _logger.info("barge-in")
         session.barge_in()
         start_capture()
       continue
@@ -249,7 +252,7 @@ def listen_worker(
       text = asr.text.strip()
       ws = session.active_connection()
       if text and ws is not None:
-        print(f"[user] {text}")
+        _logger.info("user transcript", text=text)
         try:
           send_transcript(ws, TurnTranscript("user", text, "turn_detected"))
         except Exception:

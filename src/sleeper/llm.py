@@ -3,9 +3,12 @@
 import json
 import urllib.request
 
+from libsh import get_logger
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.ollama import OllamaProvider
+
+_logger = get_logger("llm")
 
 OLLAMA_URL = "http://ollama-nvidia:11434"
 LLM_URL = f"{OLLAMA_URL}/v1"
@@ -64,6 +67,6 @@ def warm_llm() -> None:
     headers={"Content-Type": "application/json"},
     method="POST",
   )
-  print("Warming LLM...")
+  _logger.info("warming LLM")
   with urllib.request.urlopen(request) as response:
     response.read()

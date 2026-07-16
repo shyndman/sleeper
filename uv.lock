@@ -1407,26 +1407,16 @@ wheels = [
 [[package]]
 name = "libsh"
 version = "0.3.0"
-source = { editable = "../../libsh" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "pydantic" },
     { name = "rich" },
     { name = "structlog" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "numpy" },
-    { name = "pydantic", specifier = ">=2" },
-    { name = "rich", specifier = ">=14" },
-    { name = "structlog", specifier = ">=25" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "basedpyright", specifier = ">=1.39.6" },
-    { name = "pytest", specifier = ">=9.0.3" },
+sdist = { url = "https://files.pythonhosted.org/packages/6c/8c/3b055893f92d48d89c2c997e79a0dd891f0a584eba43baf6ceac7885e0d8/libsh-0.3.0.tar.gz", hash = "sha256:9cc22393f4415976708f803e2572fd844a46873944d83694414e4d06097de1d9", size = 6582, upload-time = "2026-07-06T07:04:48.461Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/db/23/9072f032292192100f214c06ef00c86360863f51fc5b76905a3f3efdf1ac/libsh-0.3.0-py3-none-any.whl", hash = "sha256:3082099a0feac31ff74f0fcb3eeb9dfbde8911d2d1b4cb9b7bb8193271773690", size = 9307, upload-time = "2026-07-06T07:04:47.371Z" },
 ]
 
 [[package]]
@@ -3300,7 +3290,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "langfuse", specifier = ">=4.14.0" },
-    { name = "libsh", editable = "../../libsh" },
+    { name = "libsh", specifier = ">=0.3.0" },
     { name = "moshi", specifier = "==0.2.11" },
     { name = "nemo-toolkit", extras = ["asr"], specifier = ">=2.6.2" },
     { name = "onnxruntime", specifier = ">=1.27.0" },
