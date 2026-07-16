@@ -9,6 +9,7 @@ authors = [{ name = "Scott Hyndman", email = "scotty.hyndman@gmail.com" }]
 # fails to source-build; pin to 3.12 so uv always resolves a wheel.
 dependencies = [
   "langfuse>=4.14.0",
+  "libsh>=0.3.0",
   "moshi==0.2.11",
   "nemo-toolkit[asr]>=2.6.2",
   "onnxruntime>=1.27.0",
@@ -66,3 +67,6 @@ select = [
   # isort
   "I",
 ]
+
+[tool.uv.sources]
+libsh = { path = "../../libsh", editable = true }

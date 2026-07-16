@@ -9,6 +9,7 @@ from contextlib import suppress
 
 import numpy as np
 from langfuse import get_client
+from libsh import setup_logging_from_env
 from moshi.models.loaders import CheckpointInfo
 from moshi.models.tts import DEFAULT_DSM_TTS_REPO, TTSModel
 from pydantic_ai import Agent
@@ -23,6 +24,7 @@ PORT = 17393
 
 
 def main() -> None:
+  setup_logging_from_env()
   get_client()
   Agent.instrument_all()
 

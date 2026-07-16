@@ -6,6 +6,7 @@ import contextlib
 import queue
 
 import sounddevice as sd
+from libsh import setup_logging_from_env
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
@@ -120,6 +121,7 @@ async def _run(url: str) -> None:
 
 
 def main() -> None:
+  setup_logging_from_env()
   parser = argparse.ArgumentParser(description="Run a remote Sleeper conversation")
   parser.add_argument("--url", default=DEFAULT_URL, help="conversation WebSocket URL")
   args: argparse.Namespace = parser.parse_args()
