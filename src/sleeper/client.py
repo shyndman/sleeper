@@ -3,8 +3,15 @@
 import argparse
 import asyncio
 import contextlib
+import os
 import queue
+import sys
+import termios
+import tty
+from collections.abc import Iterator
 
+import numpy as np
+import numpy.typing as npt
 import sounddevice as sd
 from libsh import get_logger, setup_logging_from_env
 from websockets.asyncio.client import ClientConnection, connect
@@ -19,7 +26,116 @@ OUTPUT_BYTES = OUTPUT_SAMPLES * 2
 SILENCE = bytes(OUTPUT_BYTES)
 DEFAULT_URL = "ws://127.0.0.1:17393/conversation"
 
+# Gain resets to 0 dB (unity) on each launch and steps in 2 dB increments,
+# clamped to the inclusive range below. It scales only Sleeper playback
+# samples; it never touches the operating system's output volume.
+DEFAULT_GAIN_DECIBELS = 0
+GAIN_STEP_DECIBELS = 2
+MIN_GAIN_DECIBELS = -12
+MAX_GAIN_DECIBELS = 24
+_UP_SEQUENCE = b"\x1b[A"
+_DOWN_SEQUENCE = b"\x1b[B"
+
 _logger = get_logger("client")
+
+
+class PlaybackGain:
+  """Client-local playback gain stored as one immutable snapshot.
+
+  The level lives in a single ``(decibels, multiplier)`` tuple that ``adjust``
+  replaces atomically. The real-time audio callback reads that tuple via
+  ``snapshot`` and therefore always sees either the complete old or the
+  complete new value without taking a lock.
+  """
+
+  def __init__(self) -> None:
+    self._snapshot: tuple[int, float] = (
+      DEFAULT_GAIN_DECIBELS,
+      10.0 ** (DEFAULT_GAIN_DECIBELS / 20.0),
+    )
+
+  def snapshot(self) -> tuple[int, float]:
+    return self._snapshot
+
+  def adjust(self, delta_decibels: int) -> tuple[int, float]:
+    decibels = max(MIN_GAIN_DECIBELS, min(MAX_GAIN_DECIBELS, self._snapshot[0] + delta_decibels))
+    snapshot = (decibels, 10.0 ** (decibels / 20.0))
+    self._snapshot = snapshot
+    return snapshot
+
+
+def _write_playback_frame(
+  outdata: memoryview,
+  frame: bytes,
+  multiplier: float,
+  scratch: npt.NDArray[np.float32],
+) -> None:
+  """Scale one PCM frame by ``multiplier`` into ``outdata`` without wrapping."""
+  if multiplier == 1.0:
+    # Unity gain is bit-for-bit identical to the source and allocation-free.
+    outdata[:] = frame
+    return
+  samples = np.frombuffer(frame, dtype="<i2")
+  np.multiply(samples, multiplier, out=scratch)
+  np.clip(scratch, np.iinfo(np.int16).min, np.iinfo(np.int16).max, out=scratch)
+  outdata[:] = scratch.astype("<i2").tobytes()
+
+
+def _consume_gain_keys(buffer: bytearray) -> tuple[int, ...]:
+  """Drain complete Kitty Up/Down escape sequences into dB adjustments.
+
+  Complete Up (``ESC [ A``) and Down (``ESC [ B``) sequences are removed and
+  mapped to +/- ``GAIN_STEP_DECIBELS``. An incomplete trailing escape is left
+  in ``buffer`` for the next read; any other byte is discarded.
+  """
+  adjustments: list[int] = []
+  while buffer:
+    if buffer[0] != 0x1B:
+      del buffer[0]
+      continue
+    if len(buffer) < 3:
+      break
+    prefix = bytes(buffer[:3])
+    if prefix == _UP_SEQUENCE:
+      adjustments.append(GAIN_STEP_DECIBELS)
+      del buffer[:3]
+    elif prefix == _DOWN_SEQUENCE:
+      adjustments.append(-GAIN_STEP_DECIBELS)
+      del buffer[:3]
+    else:
+      del buffer[0]
+  return tuple(adjustments)
+
+
+@contextlib.contextmanager
+def _gain_controls(gain: PlaybackGain) -> Iterator[None]:
+  # HACK: This single-user Kitty debug client parses arrow-key escape
+  # sequences directly off stdin rather than adding a keyboard dependency.
+  # Buffering across reads is required because one escape sequence
+  # (ESC '[' 'A') may be split across separate os.read() calls, so an
+  # incomplete tail is retained until the remaining bytes arrive.
+  fd = sys.stdin.fileno()
+  saved = termios.tcgetattr(fd)
+  buffer = bytearray()
+  loop = asyncio.get_running_loop()
+
+  def on_readable() -> None:
+    chunk = os.read(fd, 1024)
+    if not chunk:
+      return
+    buffer.extend(chunk)
+    for delta in _consume_gain_keys(buffer):
+      decibels, multiplier = gain.adjust(delta)
+      _logger.info("playback gain set", decibels=decibels, multiplier=multiplier)
+
+  # cbreak leaves ISIG enabled so Ctrl-C keeps generating SIGINT normally.
+  tty.setcbreak(fd)
+  loop.add_reader(fd, on_readable)
+  try:
+    yield
+  finally:
+    loop.remove_reader(fd)
+    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
 async def _send_mic(websocket: ClientConnection, microphone: queue.Queue[bytes]) -> None:
@@ -63,6 +179,8 @@ async def _receive(websocket: ClientConnection, playback: queue.SimpleQueue[byte
 async def _run(url: str) -> None:
   microphone: queue.Queue[bytes] = queue.Queue(maxsize=32)
   playback: queue.SimpleQueue[bytes] = queue.SimpleQueue()
+  gain = PlaybackGain()
+  scratch = np.empty(OUTPUT_SAMPLES, dtype=np.float32)
 
   def capture(
     indata: memoryview,
@@ -85,9 +203,12 @@ async def _run(url: str) -> None:
       outdata[:] = bytes(len(outdata))
       return
     try:
-      outdata[:] = playback.get_nowait()
+      frame = playback.get_nowait()
     except queue.Empty:
       outdata[:] = SILENCE
+      return
+    _, multiplier = gain.snapshot()
+    _write_playback_frame(outdata, frame, multiplier, scratch)
 
   with contextlib.ExitStack() as streams:
     streams.enter_context(
@@ -109,6 +230,7 @@ async def _run(url: str) -> None:
         callback=play,
       )
     )
+    streams.enter_context(_gain_controls(gain))
     while True:
       try:
         _logger.info("connecting", url=url)

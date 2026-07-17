@@ -77,6 +77,9 @@ On the machine with the microphone and speaker, start a conversation:
 uv run sleeper-client --url ws://SERVER:17393/conversation
 ```
 
+While that Kitty terminal is focused, Up/Down change only Sleeper playback gain
+in 2 dB steps, starting at 0 dB and clamping from -12 through +24 dB.
+
 On any machine with the playback speaker, speak one message:
 
 ```console
