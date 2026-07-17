@@ -19,5 +19,11 @@ class TurnTranscript:
   ended_by: Literal["turn_detected", "completed", "interrupted"]
 
 
+@dataclass(config=ConfigDict(extra="forbid", frozen=True))
+class SetVoice:
+  voice: str
+
+
 SAY_ADAPTER = TypeAdapter(Say)
 TURN_TRANSCRIPT_ADAPTER = TypeAdapter(TurnTranscript)
+SET_VOICE_ADAPTER = TypeAdapter(SetVoice)

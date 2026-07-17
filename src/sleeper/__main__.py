@@ -46,7 +46,7 @@ def main() -> None:
     ckpt = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
     tts_model = TTSModel.from_checkpoint_info(ckpt, n_q=32, temp=0.6, device="cuda")
     agent = create_llm_agent()
-    ready_message = f"ws://0.0.0.0:{PORT}/conversation and /say"
+    ready_message = f"ws://0.0.0.0:{PORT}/conversation, /say, and /voice"
 
     # The TTS worker warms up CUDA/model state before publishing readiness.
     # Block here so a warmup failure unwinds main() before any service starts.

@@ -20,7 +20,7 @@ from websockets.sync.server import ServerConnection
 if TYPE_CHECKING:
   from sleeper.conversation import ConversationSession
 
-DEFAULT_VOICE = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
+DEFAULT_VOICE = "cml-tts/fr/9834_9697_000150-0003_enhanced.wav"
 
 _logger = get_logger("tts")
 
@@ -56,7 +56,15 @@ class SayJob:
   done: threading.Event
 
 
-type SpeechQueueItem = SpeakWord | EndOfTurn | SayJob | None
+@dataclass(slots=True, frozen=True)
+class SetConversationVoice:
+  """Change the voice used when the next assistant turn opens."""
+
+  voice: str
+  result: Future[None]
+
+
+type SpeechQueueItem = SpeakWord | EndOfTurn | SayJob | SetConversationVoice | None
 
 
 class TTS:
@@ -71,7 +79,7 @@ class TTS:
     self._lock = threading.Lock()
     self._stopped = False
 
-  def _try_enqueue(self, job: SpeakWord | EndOfTurn | SayJob) -> bool:
+  def _try_enqueue(self, job: SpeakWord | EndOfTurn | SayJob | SetConversationVoice) -> bool:
     """Admit a job to the FIFO, or refuse it once shutdown has begun."""
     with self._lock:
       if self._stopped:
@@ -97,6 +105,16 @@ class TTS:
     if not self._try_enqueue(SayJob(ws, voice, text, done)):
       raise RuntimeError("TTS worker has stopped")
     done.wait()
+
+  def set_conversation_voice(self, voice: str) -> None:
+    """Change the conversation voice and block until the worker validates it."""
+    result: Future[None] = Future()
+    # Fail fast instead of blocking on a worker that will never dequeue this.
+    if not self._try_enqueue(SetConversationVoice(voice, result)):
+      raise RuntimeError("TTS worker has stopped")
+    # Block so the endpoint cannot acknowledge an unvalidated selection; a
+    # failed voice lookup/conditioning build re-raises here.
+    result.result()
 
   def stop(self) -> None:
     with self._lock:
@@ -154,6 +172,9 @@ class Synth:
     self.lm_gen: LMGen | None = None
     self.voice: str | None = None
     self.first_turn = True
+    # The voice a new assistant turn opens with; changed out-of-band by
+    # /voice and applied only when the next turn opens (see _speak_word).
+    self.conversation_voice = DEFAULT_VOICE
     self._attrs_cache: dict[str, ConditionAttributes] = {}
 
     # Script state machine: text entries queued but not yet consumed by the LM.
@@ -285,6 +306,18 @@ class Synth:
 
     _logger.info("voice set", voice=voice)
 
+  def select_conversation_voice(self, voice: str) -> None:
+    """Set the voice for the next assistant turn without disturbing this one.
+
+    Validating the voice eagerly (`_attrs`) means a bad id or a failed
+    Hugging Face lookup raises here and leaves the prior selection intact.
+    Deliberately does not call `set_voice`/reset/close: an open turn keeps
+    streaming on its current voice and the change lands when the next opens.
+    """
+    self._attrs(voice)
+    self.conversation_voice = voice
+    _logger.info("conversation voice set", voice=voice)
+
   def speak(self, text: str) -> None:
     assert self.lm_gen is not None, "set_voice must run before speak"
     entries = script_to_entries(
@@ -384,12 +417,12 @@ def _speak_word(synth: Synth, job: SpeakWord) -> None:
     return
   try:
     if not synth.turn_open:
-      synth.set_voice(DEFAULT_VOICE)
+      synth.set_voice(synth.conversation_voice)
       synth.target = job.target
       synth.conversation_audio = True
       synth.turn_open = True
       synth.turn_started_at = time.perf_counter()
-      _logger.info("turn started", voice=DEFAULT_VOICE)
+      _logger.info("turn started", voice=synth.conversation_voice)
     synth.speak(job.text)
     synth.session.playback.mark_spoken(job.text)
   except Exception as exc:
@@ -421,7 +454,17 @@ def _say(synth: Synth, job: SayJob) -> None:
     job.done.set()
 
 
-def _process_job(synth: Synth, job: SpeakWord | EndOfTurn | SayJob) -> None:
+def _set_conversation_voice(synth: Synth, job: SetConversationVoice) -> None:
+  try:
+    synth.select_conversation_voice(job.voice)
+    job.result.set_result(None)
+  except Exception as exc:
+    # A bad voice must not kill the worker; report it to the waiting endpoint.
+    _logger.exception("conversation voice selection failed", exc_info=exc, voice=job.voice)
+    job.result.set_exception(exc)
+
+
+def _process_job(synth: Synth, job: SpeakWord | EndOfTurn | SayJob | SetConversationVoice) -> None:
   match job:
     case EndOfTurn(done):
       _close_turn(synth)
@@ -430,3 +473,5 @@ def _process_job(synth: Synth, job: SpeakWord | EndOfTurn | SayJob) -> None:
       _speak_word(synth, job)
     case SayJob():
       _say(synth, job)
+    case SetConversationVoice():
+      _set_conversation_voice(synth, job)

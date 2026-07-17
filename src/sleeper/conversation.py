@@ -192,6 +192,10 @@ class ConversationSession:
     """Speak one isolated `/say` request outside the conversation lifecycle."""
     self._tts.say(ws, voice, text)
 
+  def set_conversation_voice(self, voice: str) -> None:
+    """Change the voice used for subsequent conversational replies."""
+    self._tts.set_conversation_voice(voice)
+
   def run_tts(
     self,
     tts_model: "TTSModel",

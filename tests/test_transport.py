@@ -5,12 +5,15 @@ import functools
 import http.server
 import json
 import queue
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from types import TracebackType
 from typing import cast
 
@@ -31,9 +34,16 @@ from sleeper.conversation import (
   send_transcript,
   turn_loop,
 )
-from sleeper.messages import SAY_ADAPTER, TURN_TRANSCRIPT_ADAPTER, Say, TurnTranscript
+from sleeper.messages import (
+  SAY_ADAPTER,
+  SET_VOICE_ADAPTER,
+  TURN_TRANSCRIPT_ADAPTER,
+  Say,
+  SetVoice,
+  TurnTranscript,
+)
 from sleeper.playback import PlaybackTracker
-from sleeper.tts import EndOfTurn, SayJob, SpeakWord
+from sleeper.tts import DEFAULT_VOICE, EndOfTurn, SayJob, SetConversationVoice, SpeakWord
 
 
 @contextmanager
@@ -193,6 +203,9 @@ def test_startup_warms_ollama_with_model_and_keep_alive() -> None:
       TURN_TRANSCRIPT_ADAPTER,
       '{"role":"assistant","text":"hello","ended_by":"completed","extra":true}',
     ),
+    (SET_VOICE_ADAPTER, '{"voice":1}'),
+    (SET_VOICE_ADAPTER, '{"voice":"x","extra":true}'),
+    (SET_VOICE_ADAPTER, "{}"),
   ],
 )
 def test_json_messages_reject_wrong_types_literals_and_extra_fields(adapter, payload):
@@ -205,8 +218,10 @@ def test_json_messages_round_trip_valid_contracts():
   transcript = TURN_TRANSCRIPT_ADAPTER.validate_json(
     '{"role":"assistant","text":"hello","ended_by":"interrupted"}'
   )
+  set_voice = SET_VOICE_ADAPTER.validate_json('{"voice":"expresso/ex.wav"}')
   assert say == Say(text="hello", voice=None)
   assert transcript == TurnTranscript(role="assistant", text="hello", ended_by="interrupted")
+  assert set_voice == SetVoice(voice="expresso/ex.wav")
 
 
 def test_conversation_decodes_pcm_and_routes_audio_and_transcript(harness):
@@ -606,6 +621,7 @@ def test_tts_clean_close_abandons_turn_once(monkeypatch, capsys):
       self.turn_open = False
       self.turn_failed = False
       self.turn_started_at: float | None = None
+      self.conversation_voice = DEFAULT_VOICE
       self.conversation_speak_calls = 0
       self.abort_calls = 0
       created.append(self)
@@ -768,3 +784,183 @@ def test_tts_stop_releases_late_end_turn():
   # Only the sentinel is queued; no EndOfTurn was admitted after it.
   assert worker._jobs.get_nowait() is None
   assert worker._jobs.empty()
+
+
+def test_voice_routes_request_and_echoes_applied_voice(harness):
+  applied: queue.Queue[str] = queue.Queue()
+
+  def apply_one():
+    item = harness.session._tts._jobs.get(timeout=2)
+    assert isinstance(item, SetConversationVoice)
+    applied.put(item.voice)
+    item.result.set_result(None)
+
+  consumer = threading.Thread(target=apply_one)
+  consumer.start()
+  with (
+    running_server(harness.handler) as base_url,
+    connect(f"{base_url}/voice", compression=None) as websocket,
+  ):
+    websocket.send(SET_VOICE_ADAPTER.dump_json(SetVoice(voice="expresso/ex.wav")).decode())
+    # The echo only returns after the worker accepted and validated the voice.
+    assert SET_VOICE_ADAPTER.validate_json(websocket.recv()) == SetVoice(voice="expresso/ex.wav")
+    with pytest.raises(ConnectionClosed) as closed:
+      websocket.recv()
+  consumer.join(timeout=2)
+  assert not consumer.is_alive()
+  assert applied.get_nowait() == "expresso/ex.wav"
+  assert closed.value.rcvd is not None
+  assert closed.value.rcvd.code == 1000
+
+
+def test_voice_rejection_closes_with_application_error(harness):
+  def reject_one():
+    item = harness.session._tts._jobs.get(timeout=2)
+    assert isinstance(item, SetConversationVoice)
+    item.result.set_exception(ValueError("no such voice"))
+
+  rejecter = threading.Thread(target=reject_one)
+  rejecter.start()
+  with (
+    running_server(harness.handler) as base_url,
+    connect(f"{base_url}/voice", compression=None) as websocket,
+  ):
+    websocket.send(SET_VOICE_ADAPTER.dump_json(SetVoice(voice="bad")).decode())
+    # A rejected selection closes with an application error and never echoes.
+    with pytest.raises(ConnectionClosed) as closed:
+      websocket.recv()
+  rejecter.join(timeout=2)
+  assert not rejecter.is_alive()
+  assert closed.value.rcvd is not None
+  assert closed.value.rcvd.code == 1007
+
+
+def test_conversation_voice_change_applies_to_next_turn(monkeypatch):
+  new_voice = "expresso/ex-new.wav"
+  created: list[object] = []
+
+  class FakeSynth:
+    def __init__(self, tts_model: object, session: ConversationSession) -> None:
+      self.session = session
+      self.target: object | None = None
+      self.conversation_audio = False
+      self.turn_open = False
+      self.turn_failed = False
+      self.turn_started_at: float | None = None
+      self.conversation_voice = DEFAULT_VOICE
+      # Records the voice every turn (and warmup) opens with, in order.
+      self.opened_voices: list[str] = []
+      created.append(self)
+
+    def set_voice(self, voice: str) -> None:
+      self.opened_voices.append(voice)
+
+    def select_conversation_voice(self, voice: str) -> None:
+      self.conversation_voice = voice
+
+    def speak(self, text: str) -> None:
+      pass
+
+    def end_turn(self) -> None:
+      pass
+
+    def abort_turn(self) -> None:
+      pass
+
+  class FakeMimi:
+    def streaming(self, batch_size: int):
+      assert batch_size == 1
+      return nullcontext()
+
+  class FakeTtsModel:
+    mimi = FakeMimi()
+
+  monkeypatch.setattr(tts, "Synth", FakeSynth)
+  session = ConversationSession()
+  connection = object()
+  voice_result: Future[None] = Future()
+  done_one = threading.Event()
+  done_two = threading.Event()
+
+  # First turn opens, voice change lands mid-turn, second word stays in it, the
+  # turn closes, then a second turn opens after the change took effect.
+  session._tts.speak_word(cast(ServerConnection, connection), "one")
+  session._tts._jobs.put(SetConversationVoice(new_voice, voice_result))
+  session._tts.speak_word(cast(ServerConnection, connection), "two")
+  session._tts.end_turn(done_one)
+  session._tts.speak_word(cast(ServerConnection, connection), "three")
+  session._tts.end_turn(done_two)
+  session._tts.stop()
+
+  startup: Future[None] = Future()
+  session._tts.run(FakeTtsModel(), session, startup, "[ready]")
+
+  assert startup.exception() is None
+  assert voice_result.result() is None
+  assert done_one.is_set()
+  assert done_two.is_set()
+  # Index 0 is warmup; the first conversation turn stays on DEFAULT_VOICE and
+  # only the second turn opens with the newly selected voice.
+  assert created[0].opened_voices == [DEFAULT_VOICE, DEFAULT_VOICE, new_voice]
+
+
+def test_invalid_conversation_voice_preserves_selection():
+  class FakeMachine:
+    def new_state(self, entries: list[object]) -> object:
+      return object()
+
+  class FakeTtsModel:
+    machine = FakeMachine()
+
+    def get_voice_path(self, voice: str) -> str:
+      raise RuntimeError("HF 404")
+
+    def make_condition_attributes(self, paths: list[str], cfg_coef: float) -> object:
+      raise AssertionError("must not build conditioning for an unresolved voice")
+
+  synth = tts.Synth(FakeTtsModel(), ConversationSession())
+  with pytest.raises(RuntimeError, match="HF 404"):
+    synth.select_conversation_voice("nonexistent")
+  assert synth.conversation_voice == DEFAULT_VOICE
+
+
+def test_set_voice_script_sends_request_and_requires_ack():
+  script = Path(__file__).parent.parent / "scripts" / "set_voice.py"
+  received: queue.Queue[str] = queue.Queue()
+
+  def echo_handler(ws: ServerConnection) -> None:
+    raw = ws.recv()
+    assert isinstance(raw, str)
+    received.put(raw)
+    ws.send(raw)
+
+  with running_server(echo_handler) as base_url:
+    result = subprocess.run(
+      [sys.executable, str(script), "--url", f"{base_url}/voice", "test-voice"],
+      capture_output=True,
+      text=True,
+      timeout=10,
+    )
+  assert json.loads(received.get(timeout=2)) == {"voice": "test-voice"}
+  assert result.returncode == 0
+  assert result.stdout == ""
+  assert result.stderr == ""
+
+
+def test_set_voice_script_fails_on_mismatched_ack():
+  script = Path(__file__).parent.parent / "scripts" / "set_voice.py"
+
+  def wrong_ack_handler(ws: ServerConnection) -> None:
+    ws.recv()
+    ws.send(json.dumps({"voice": "other"}))
+
+  with running_server(wrong_ack_handler) as base_url:
+    result = subprocess.run(
+      [sys.executable, str(script), "--url", f"{base_url}/voice", "test-voice"],
+      capture_output=True,
+      text=True,
+      timeout=10,
+    )
+  assert result.returncode == 1
+  assert result.stdout == ""
+  assert "error:" in result.stderr
