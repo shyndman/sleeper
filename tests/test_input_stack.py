@@ -12,7 +12,13 @@ import pytest
 import sphn
 import torch
 
-from sleeper.asr import MIC_SR, SMART_TURN_ONNX, StreamingASR, TurnDetector
+from sleeper.asr import (
+  MIC_SR,
+  SMART_TURN_ONNX,
+  SMART_TURN_WINDOW_SECONDS,
+  StreamingASR,
+  TurnDetector,
+)
 
 AUDIO_FILE = Path(__file__).parent / "data" / "bria.mp3"
 BLOCK = 512  # same mic blocksize the live loop uses
@@ -29,7 +35,9 @@ def test_asr_transcribes_and_resets(audio: np.ndarray) -> None:
   asr = StreamingASR()
   for start in range(0, len(audio), BLOCK):
     asr.feed(audio[start : start + BLOCK])
-  full_text = asr.text.strip()
+  running_text = asr.text.strip()
+  full_text = asr.finish().strip()
+  assert full_text.startswith(running_text), "finalization replaced existing transcript"
   assert len(full_text.split()) > 5, "transcript suspiciously short"
 
   # reset() must give a genuinely fresh utterance, not a continuation.
@@ -39,6 +47,17 @@ def test_asr_transcribes_and_resets(audio: np.ndarray) -> None:
     asr.feed(audio[start : start + BLOCK])
   partial = asr.text.strip()
   assert partial and full_text.lower().startswith(partial.split()[0].lower())
+
+
+def test_smart_turn_left_pads_short_audio() -> None:
+  audio = np.ones(MIC_SR, dtype=np.float32)
+
+  window = TurnDetector._model_window(audio)
+
+  padding_samples = (SMART_TURN_WINDOW_SECONDS - 1) * MIC_SR
+  assert len(window) == SMART_TURN_WINDOW_SECONDS * MIC_SR
+  assert not np.any(window[:padding_samples])
+  np.testing.assert_array_equal(window[padding_samples:], audio)
 
 
 def test_smart_turn_separates_done_from_mid_sentence(audio: np.ndarray) -> None:

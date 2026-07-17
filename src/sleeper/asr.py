@@ -3,6 +3,7 @@
 import queue
 import threading
 from collections import deque
+from enum import Enum, auto
 from pathlib import Path
 
 import numpy as np
@@ -37,10 +38,9 @@ ASR_MODEL = "nvidia/nemotron-speech-streaming-en-0.6b"
 # frozen tuple is expanded with list(...) at the call site.
 ASR_ATT_CONTEXT: tuple[int, int] = (70, 1)
 SMART_TURN_ONNX = Path(__file__).parent / "models" / "smart-turn-v3.2-cpu.onnx"
+SMART_TURN_WINDOW_SECONDS = 8
 TURN_COMPLETE_THRESHOLD = 0.5  # smart-turn sigmoid; >= means the user is done
-TURN_CHECK_EVERY_BLOCKS = 16  # re-run smart-turn every ~512ms of silence
-FORCE_TURN_END_MS = 2500  # stop waiting on smart-turn after this much silence
-PREROLL_SECONDS = 2.0  # mic history replayed into ASR at capture start
+PREROLL_SECONDS = 0.3  # mic history replayed into ASR at capture start
 
 
 class StreamingASR:
@@ -60,9 +60,13 @@ class StreamingASR:
 
   HOP = 160  # preprocessor hop: one mel frame per 10ms at 16kHz
 
+  # One chunk supplies encoder lookahead; the second lets RNNT emit its tail.
+  FINAL_PADDING_MULTIPLIER = ASR_ATT_CONTEXT[1] + 1
+
   def __init__(self) -> None:
     # Silence their extremely noisy logs
     from nemo.utils.nemo_logging import Logger
+
     nemo_logger = Logger()
     nemo_logger.remove_stream_handlers()
 
@@ -112,21 +116,30 @@ class StreamingASR:
 
     # +1: the trailing edge frame is never consumed (incomplete STFT window).
     while len(self._audio) >= (self._emitted + self.shift_frames + 1) * self.HOP:
-      self._step()
+      self._step(final=False)
+    return self.text
+
+  def finish(self) -> str:
+    """Close the utterance and emit text still waiting on trailing context."""
+    padding_frames = self.FINAL_PADDING_MULTIPLIER * self.shift_frames
+    self._audio = np.concatenate(
+      [self._audio, np.zeros(padding_frames * self.HOP, dtype=np.float32)]
+    )
+    self._step(final=True)
     return self.text
 
   @torch.inference_mode()
-  def _step(self) -> None:
+  def _step(self, *, final: bool) -> None:
     sig = torch.from_numpy(self._audio).unsqueeze(0).to(self.model.device)
     sig_len = torch.tensor([len(self._audio)], device=self.model.device)
     mel, _ = self.model.preprocessor(input_signal=sig, length=sig_len)
 
     if self._emitted == 0:
-      start, end, drop = 0, self.shift_frames, 0
+      start, drop = 0, 0
     else:
       start = self._emitted - self.pre_cache_frames
-      end = self._emitted + self.shift_frames
       drop = self.drop_extra
+    end = mel.shape[-1] if final else self._emitted + self.shift_frames
 
     chunk_mel = mel[:, :, start:end]
     chunk_len = torch.tensor([chunk_mel.shape[-1]], device=self.model.device)
@@ -143,14 +156,22 @@ class StreamingASR:
       cache_last_channel=self._cache_ch,
       cache_last_time=self._cache_t,
       cache_last_channel_len=self._cache_len,
-      keep_all_outputs=False,  # a mic stream never "ends"
+      keep_all_outputs=final,
       previous_hypotheses=self._hyps,
       previous_pred_out=self._pred,
       drop_extra_pre_encoded=drop,
       return_transcription=True,
     )
-    self._emitted += self.shift_frames
+    self._emitted = end if final else self._emitted + self.shift_frames
     self.text = texts[0].text
+
+
+class TurnState(Enum):
+  """Whether a user turn is absent, recording speech, or waiting for continuation."""
+
+  IDLE = auto()
+  RECORDING = auto()
+  AWAITING_SPEECH = auto()
 
 
 class TurnDetector:
@@ -162,14 +183,22 @@ class TurnDetector:
     self.extractor = WhisperFeatureExtractor(chunk_length=8)
     self.session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
 
+  @staticmethod
+  def _model_window(audio: np.ndarray) -> np.ndarray:
+    """Place recent audio at the end of the model's fixed-length input."""
+    window_samples = SMART_TURN_WINDOW_SECONDS * MIC_SR
+    audio = audio[-window_samples:]
+    return np.pad(audio, (window_samples - len(audio), 0))
+
   def complete_probability(self, audio: np.ndarray) -> float:
-    """Probability the utterance (last <=8s kept, per model window) is complete."""
+    """Probability the utterance is complete from its last eight seconds."""
+    window_samples = SMART_TURN_WINDOW_SECONDS * MIC_SR
     inputs = self.extractor(
-      audio[-8 * MIC_SR :],
+      self._model_window(audio),
       sampling_rate=MIC_SR,
       return_tensors="np",
       padding="max_length",
-      max_length=8 * MIC_SR,
+      max_length=window_samples,
       truncation=True,
       do_normalize=True,
     )
@@ -178,91 +207,128 @@ class TurnDetector:
     return float(output.ravel()[0])
 
 
+class VoiceInputProcessor:
+  """Route microphone blocks through barge-in or one persistent user turn."""
+
+  def __init__(
+    self,
+    turns: queue.Queue[TurnQueueItem],
+    session: ConversationSession,
+  ) -> None:
+    from silero_vad import load_silero_vad
+
+    _logger.info("loading voice input models")
+    vad = load_silero_vad()
+    vad.reset_states()
+
+    self.turns = turns
+    self.session = session
+    self.gate = SpeechGate(vad)
+    self.bargein = BargeInDetector(BARGEIN_ONNX, BARGEIN_META)
+    self.bargein.probability(np.zeros(WINDOW_SAMPLES, dtype=np.float32))
+    self.turn_detector = TurnDetector(SMART_TURN_ONNX)
+    self.turn_detector.complete_probability(np.zeros(MIC_SR, dtype=np.float32))
+    self.asr = StreamingASR()
+    self.asr.feed(np.zeros(MIC_SR, dtype=np.float32))
+    self.asr.reset()
+
+    self.preroll: deque[np.ndarray] = deque(
+      maxlen=int(PREROLL_SECONDS * MIC_SR / VAD_FRAME_SAMPLES)
+    )
+    self.utterance: deque[np.ndarray] = deque(
+      maxlen=int(SMART_TURN_WINDOW_SECONDS * MIC_SR / VAD_FRAME_SAMPLES)
+    )
+    self.bargein_window = np.zeros(WINDOW_SAMPLES, dtype=np.float32)
+    self.turn_state = TurnState.IDLE
+
+  def process(self, chunk: np.ndarray) -> None:
+    """Consume one microphone block according to the active speaker."""
+    self.preroll.append(chunk)
+    self.bargein_window = np.concatenate([self.bargein_window[len(chunk) :], chunk])
+    speaking = self.gate.update(chunk)
+
+    if self.session.is_assistant():
+      self._process_assistant_audio(speaking)
+    else:
+      self._process_user_audio(chunk, speaking)
+
+  def _process_assistant_audio(self, speaking: bool) -> None:
+    self.turn_state = TurnState.IDLE
+    if not speaking or self.bargein.probability(self.bargein_window) < self.bargein.threshold:
+      return
+
+    _logger.info("barge-in")
+    self.session.barge_in()
+    self._start_turn()
+
+  def _process_user_audio(self, chunk: np.ndarray, speaking: bool) -> None:
+    if self.turn_state is TurnState.IDLE:
+      if speaking:
+        self._start_turn()
+      return
+
+    if speaking:
+      self.turn_state = TurnState.RECORDING
+      self._record(chunk)
+      return
+
+    if self.turn_state is TurnState.AWAITING_SPEECH:
+      return
+
+    # Keep one VAD-negative block after the gate's hangover so Smart Turn sees
+    # a natural acoustic endpoint, but do not keep recording a rejected pause.
+    self._record(chunk)
+    p_turn_end = self.turn_detector.complete_probability(np.concatenate(self.utterance))
+    if p_turn_end < TURN_COMPLETE_THRESHOLD:
+      # An incomplete semantic turn deliberately remains open indefinitely.
+      # Only more speech followed by another VAD endpoint can reconsider it;
+      # there is no timeout because observed use has not justified one.
+      self.turn_state = TurnState.AWAITING_SPEECH
+      return
+
+    self._finish_turn()
+
+  def _start_turn(self) -> None:
+    self.asr.reset()
+    self.utterance.clear()
+    self.utterance.extend(self.preroll)
+    for block in self.preroll:
+      self.asr.feed(block)
+    self.turn_state = TurnState.RECORDING
+
+  def _record(self, chunk: np.ndarray) -> None:
+    self.utterance.append(chunk)
+    self.asr.feed(chunk)
+
+  def _finish_turn(self) -> None:
+    self.turn_state = TurnState.IDLE
+    text = self.asr.finish().strip()
+    ws = self.session.active_connection()
+    if not text or ws is None:
+      return
+
+    _logger.info("user transcript", text=text)
+    try:
+      send_transcript(ws, TurnTranscript("user", text, "turn_detected"))
+    except Exception:
+      _logger.exception("user transcript send failed")
+      self.session.return_to_user()
+      return
+    self.session.user_turn_finished()
+    self.turns.put(QueuedTurn(ws, text))
+
+
 def listen_worker(
   mic_frames: queue.Queue[np.ndarray],
   turns: queue.Queue[TurnQueueItem],
   session: ConversationSession,
   stopping: threading.Event,
 ) -> None:
-  """Consume 512-sample remote mic frames; own all voice-input models."""
-  from silero_vad import load_silero_vad
-
-  _logger.info("loading voice input models")
-
-  vad = load_silero_vad()
-  vad.reset_states()
-  gate = SpeechGate(vad)
-  bargein = BargeInDetector(BARGEIN_ONNX, BARGEIN_META)
-  bargein.probability(np.zeros(WINDOW_SAMPLES, dtype=np.float32))
-  turn_detector = TurnDetector(SMART_TURN_ONNX)
-  turn_detector.complete_probability(np.zeros(MIC_SR, dtype=np.float32))
-  asr = StreamingASR()
-  asr.feed(np.zeros(MIC_SR, dtype=np.float32))
-  asr.reset()
-
-  preroll: deque[np.ndarray] = deque(maxlen=int(PREROLL_SECONDS * MIC_SR / VAD_FRAME_SAMPLES))
-  utterance: deque[np.ndarray] = deque(maxlen=int(8 * MIC_SR / VAD_FRAME_SAMPLES))
-  window = np.zeros(WINDOW_SAMPLES, dtype=np.float32)
-  capturing = False
-  silence_blocks = 0
-  force_blocks = int(FORCE_TURN_END_MS / 1000 * MIC_SR / VAD_FRAME_SAMPLES)
-
-  def start_capture() -> None:
-    nonlocal capturing, silence_blocks
-    asr.reset()
-    utterance.clear()
-    utterance.extend(preroll)
-    for block in preroll:
-      asr.feed(block)
-    capturing = True
-    silence_blocks = 0
-
+  """Forward queued microphone blocks into the stateful voice-input processor."""
+  processor = VoiceInputProcessor(turns, session)
   while not stopping.is_set():
     try:
       chunk = mic_frames.get(timeout=0.25)
     except queue.Empty:
       continue
-    preroll.append(chunk)
-    window = np.concatenate([window[len(chunk) :], chunk])
-    speaking = gate.update(chunk)
-
-    if session.is_assistant():
-      capturing = False
-      if speaking and bargein.probability(window) >= bargein.threshold:
-        _logger.info("barge-in")
-        session.barge_in()
-        start_capture()
-      continue
-
-    if not capturing:
-      if speaking:
-        start_capture()
-      continue
-    utterance.append(chunk)
-    asr.feed(chunk)
-
-    if speaking:
-      silence_blocks = 0
-      continue
-    silence_blocks += 1
-    if silence_blocks % TURN_CHECK_EVERY_BLOCKS == 1:
-      ended = (
-        turn_detector.complete_probability(np.concatenate(utterance)) >= TURN_COMPLETE_THRESHOLD
-      )
-    else:
-      ended = silence_blocks >= force_blocks
-
-    if ended:
-      capturing = False
-      text = asr.text.strip()
-      ws = session.active_connection()
-      if text and ws is not None:
-        _logger.info("user transcript", text=text)
-        try:
-          send_transcript(ws, TurnTranscript("user", text, "turn_detected"))
-        except Exception:
-          capturing = False
-          session.return_to_user()
-          continue
-        session.user_turn_finished()
-        turns.put(QueuedTurn(ws, text))
+    processor.process(chunk)
