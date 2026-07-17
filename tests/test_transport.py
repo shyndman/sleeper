@@ -391,6 +391,9 @@ def test_turn_loop_streams_response_to_speech(capsys):
   output = capsys.readouterr().out
   assert "llm request" in output
   assert "prompt='How are you?'" in output
+  assert "assistant transcript" in output
+  assert "text='Hello there'" in output
+  assert "ended_by=completed" in output
   assert isinstance(session._tts._jobs.get_nowait(), SpeakWord)
   assert isinstance(session._tts._jobs.get_nowait(), SpeakWord)
   assert isinstance(session._tts._jobs.get_nowait(), EndOfTurn)

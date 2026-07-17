@@ -277,10 +277,14 @@ async def _run_turn(
       )
     )
 
+  transcript = TurnTranscript("assistant", spoken, "completed" if completed else "interrupted")
+  _logger.info(
+    "assistant transcript",
+    text=transcript.text,
+    ended_by=transcript.ended_by,
+  )
   try:
-    send_transcript(
-      ws, TurnTranscript("assistant", spoken, "completed" if completed else "interrupted")
-    )
+    send_transcript(ws, transcript)
   except ConnectionClosedOK:
     _logger.info("client disconnected before transcript")
   except Exception:
