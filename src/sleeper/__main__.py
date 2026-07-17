@@ -18,7 +18,7 @@ from websockets.sync.server import serve
 from sleeper import server
 from sleeper.asr import VAD_FRAME_SAMPLES, listen_worker
 from sleeper.conversation import ConversationSession, TurnQueueItem, turn_loop
-from sleeper.llm import create_llm_agent, warm_llm
+from sleeper.llm import create_llm_agent
 
 PORT = 17393
 
@@ -36,8 +36,9 @@ def main() -> None:
   session = ConversationSession()
   stopping = threading.Event()
 
-  # Model load, LLM warmup, and TTS/CUDA warmup all reach over the network or to
-  # the GPU and can fail fatally before any service is up. Route the failure
+  # TTS model load and TTS/CUDA warmup reach over the network or to the GPU and
+  # can fail fatally before any service is up. The LLM is already resident behind
+  # llama-server's health gate, so no LLM warmup happens here. Route the failure
   # through libsh so the traceback renders in the structured format, then exit
   # non-zero so the container reports the crash instead of dumping a raw trace.
   try:
@@ -45,7 +46,6 @@ def main() -> None:
     ckpt = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
     tts_model = TTSModel.from_checkpoint_info(ckpt, n_q=32, temp=0.6, device="cuda")
     agent = create_llm_agent()
-    warm_llm()
     ready_message = f"ws://0.0.0.0:{PORT}/conversation and /say"
 
     # The TTS worker warms up CUDA/model state before publishing readiness.

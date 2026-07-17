@@ -1,22 +1,15 @@
-"""Voice-assistant LLM configuration, creation, and startup warmup."""
+"""Voice-assistant LLM configuration and creation."""
 
-import json
-import urllib.request
-
-from libsh import get_logger
 from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
-from pydantic_ai.providers.ollama import OllamaProvider
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
-_logger = get_logger("llm")
-
-OLLAMA_URL = "http://ollama-nvidia:11434"
-LLM_URL = f"{OLLAMA_URL}/v1"
-LLM_MODEL = "hf.co/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive:Q5_K_M"
-LLM_KEEP_ALIVE = "1440m"
-LLM_REASONING_EFFORT = "none"
-LLM_ENABLE_THINKING = False
-LLM_WARMUP_PROMPT = "hi"
+# Sleeper talks to the in-container llama-server over its local OpenAI-compatible
+# endpoint. The model is loaded and health-gated by the entrypoint before this
+# process starts, so no client-side warmup is needed. LLM_MODEL is any non-empty
+# string -- llama-server serves the single model it loaded and ignores selection.
+LLM_URL = "http://127.0.0.1:8080/v1"
+LLM_MODEL = "ternary-bonsai-27b"
 
 # Everything the LLM emits goes straight to TTS, so the instructions steer it toward
 # speakable prose: no markup for the synthesizer to read aloud, numbers written out
@@ -35,38 +28,9 @@ engine, so write for the ear, not the page:
 
 
 def create_llm_agent() -> Agent[None, str]:
-  """Create the voice assistant agent over Ollama's OpenAI-compatible API."""
+  """Create the voice assistant agent over the local OpenAI-compatible server."""
+  # api_key is a non-empty placeholder; the local llama-server does not check it.
   return Agent(
-    OpenAIChatModel(LLM_MODEL, provider=OllamaProvider(base_url=LLM_URL)),
+    OpenAIChatModel(LLM_MODEL, provider=OpenAIProvider(base_url=LLM_URL, api_key="local")),
     instructions=SPEAKABLE_SYSTEM_PROMPT,
-    model_settings=OpenAIChatModelSettings(
-      openai_reasoning_effort=LLM_REASONING_EFFORT,
-    ),
   )
-
-
-def warm_llm() -> None:
-  """Load the LLM at startup and retain it for one day; discard its reply."""
-  # HACK: Ollama's OpenAI-compatible endpoint silently drops keep_alive.
-  # Sending the warmup through its native chat endpoint sets the loaded runner's
-  # retention period. Later OpenAI-compatible requests reuse that runner without
-  # replacing the period, so each completed request resets the full one-day timer.
-  payload = json.dumps(
-    {
-      "model": LLM_MODEL,
-      "messages": [{"role": "user", "content": LLM_WARMUP_PROMPT}],
-      "stream": False,
-      "keep_alive": LLM_KEEP_ALIVE,
-      "think": LLM_ENABLE_THINKING,
-    }
-  ).encode("utf-8")
-
-  request = urllib.request.Request(
-    f"{OLLAMA_URL}/api/chat",
-    data=payload,
-    headers={"Content-Type": "application/json"},
-    method="POST",
-  )
-  _logger.info("warming LLM")
-  with urllib.request.urlopen(request) as response:
-    response.read()
