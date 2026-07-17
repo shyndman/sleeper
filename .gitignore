@@ -7,10 +7,22 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
 
 # Generated audio
 *.wav
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.coverage
+htmlcov/
+coverage.xml
+
+# Model download cache (HF hub writes into the tracked models dir)
+.cache/
 
 # Deploy config (Taskfile)
 .env
