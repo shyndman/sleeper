@@ -32,13 +32,22 @@ terminate() {
 trap terminate SIGTERM SIGINT
 
 # Wait for the LLM to load (and download on first run) before starting sleeper.
-# If llama-server dies during load, fail fast rather than poll forever.
+# On first run llama-server downloads the multi-GB GGUF into /models; its progress
+# bar is carriage-return-based and does not surface in Docker logs, so we emit our
+# own heartbeat to prove the wait is alive rather than hung. If llama-server dies
+# during load, fail fast rather than poll forever.
+echo "entrypoint: waiting for llama-server /health (first run downloads the GGUF into /models -- can take a while)" >&2
+waited=0
 until curl -sf http://127.0.0.1:8080/health >/dev/null 2>&1; do
   if ! kill -0 "$llama_pid" 2>/dev/null; then
     echo "entrypoint: llama-server exited before becoming healthy" >&2
     exit 1
   fi
   sleep 1
+  waited=$((waited + 1))
+  if [ $((waited % 10)) -eq 0 ]; then
+    echo "entrypoint: still waiting for llama-server /health (${waited}s elapsed)" >&2
+  fi
 done
 echo "entrypoint: llama-server healthy; starting sleeper" >&2
 
