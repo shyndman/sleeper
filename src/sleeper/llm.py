@@ -34,6 +34,8 @@ _LOCAL_DATETIME_FORMAT = "%A, %B %d, %Y at %I:%M %p %Z"
 # Gives the assistant the machine's current wall-clock time, including the weekday
 # and local timezone, so time-sensitive answers do not depend on model knowledge.
 def get_local_datetime() -> str:
+  """Use when asked about the time or date, or when you need to know when now is
+  for date-based calculation."""
   return datetime.now().astimezone().strftime(_LOCAL_DATETIME_FORMAT)
 
 
