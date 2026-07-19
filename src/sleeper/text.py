@@ -1,12 +1,12 @@
 """Utilities for processing asynchronously streamed text."""
 
 import re
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable
 
 WORD_BREAK = re.compile(r"\s+")
 
 
-async def iter_words(chunks: AsyncIterable[str]) -> AsyncIterator[str]:
+async def iter_words(chunks: AsyncIterable[str]) -> AsyncGenerator[str, None]:
   """Yield whitespace-delimited words reconstructed across text chunks.
 
   A final word does not need trailing whitespace; it is emitted when the input

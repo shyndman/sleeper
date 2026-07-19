@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator
 from concurrent.futures import Future
 from contextlib import aclosing
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from libsh import get_logger
 from pydantic_ai import Agent
@@ -231,9 +231,19 @@ async def _prompt_agent(
   user interrupted the turn.
   """
   _logger.info("llm request", prompt=prompt)
-  async with agent.run_stream(prompt, message_history=history) as result:
-    # This would be better as `async yield from`, but alas, not yet a thing
-    async for word in iter_words(result.stream_text(delta=True)):
+  # `async for` abandons its iterator on GeneratorExit rather than closing it, so
+  # an interrupted turn would leak the nested stream_text/iter_words generators to
+  # the loop's shutdown_asyncgens finalizer, which then trips `aclose():
+  # asynchronous generator is already running` against the half-torn-down
+  # pydantic-ai stream. Explicitly close the whole chain when the turn unwinds.
+  async with (
+    agent.run_stream(prompt, message_history=history) as result,
+    # pydantic-ai types stream_text() as AsyncIterator, but it is a real async
+    # generator at runtime; narrow it so aclosing() can drive its finalizer.
+    aclosing(cast("AsyncGenerator[str]", result.stream_text(delta=True))) as stream,
+    aclosing(iter_words(stream)) as words,
+  ):
+    async for word in words:
       yield word
 
 
