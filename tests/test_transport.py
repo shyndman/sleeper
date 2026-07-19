@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 from pydantic_ai.exceptions import ModelAPIError
+from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.toolsets import FunctionToolset
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 from websockets.frames import Close
@@ -495,14 +496,20 @@ def test_interrupted_transcript_precedes_tts_cleanup():
       return False
 
   class FakeAgent:
-    def run_stream(self, prompt: str, *, message_history: list[object]) -> FakeRunStream:
+    def __init__(self) -> None:
+      self.message_history: list[ModelMessage] | None = None
+
+    def run_stream(self, prompt: str, *, message_history: list[ModelMessage]) -> FakeRunStream:
+      self.message_history = message_history
       return FakeRunStream()
+
+  agent = FakeAgent()
 
   async def run_scenario() -> None:
     turns: queue.Queue = queue.Queue()
     turns.put(QueuedTurn(connection, "Stop talking"))
     turns.put(None)
-    task = asyncio.create_task(turn_loop(FakeAgent(), turns, session, threading.Event()))
+    task = asyncio.create_task(turn_loop(agent, turns, session, threading.Event()))
 
     await asyncio.wait_for(asyncio.to_thread(transcript_sent.wait), timeout=1)
     cleanup_done = tts_worker.cleanup_done
@@ -515,6 +522,15 @@ def test_interrupted_transcript_precedes_tts_cleanup():
     finally:
       cleanup_done.set()
       await asyncio.wait_for(task, timeout=1)
+    assert agent.message_history is not None
+    interruption = agent.message_history[-1]
+    assert isinstance(interruption, ModelRequest)
+    assert len(interruption.parts) == 1
+    part = interruption.parts[0]
+    assert isinstance(part, UserPromptPart)
+    assert (
+      part.content == "<system-reminder>User interrupted your previous reply.</system-reminder>"
+    )
 
   asyncio.run(run_scenario())
 

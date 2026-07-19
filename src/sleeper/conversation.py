@@ -3,8 +3,9 @@
 import asyncio
 import queue
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from concurrent.futures import Future
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -15,7 +16,6 @@ from pydantic_ai.messages import (
   ModelMessage,
   ModelRequest,
   ModelResponse,
-  SystemPromptPart,
   TextPart,
   UserPromptPart,
 )
@@ -223,7 +223,7 @@ async def _prompt_agent(
   agent: Agent[None, str],
   prompt: str,
   history: list[ModelMessage],
-) -> AsyncIterator[str]:
+) -> AsyncGenerator[str, None]:
   """Stream an assistant response into word-sized speech jobs.
 
   Complete words are queued as soon as they arrive so playback can begin while
@@ -253,10 +253,11 @@ async def _run_turn(
 
   turn = session.assistant_turn_started(ws)
 
-  async for word in _prompt_agent(agent, item.prompt, history):
-    if turn.interrupted.is_set():
-      break
-    turn.speak(word)
+  async with aclosing(_prompt_agent(agent, item.prompt, history)) as words:
+    async for word in words:
+      if turn.interrupted.is_set():
+        break
+      turn.speak(word)
   turn.end()
 
   completed, spoken = await asyncio.to_thread(turn.wait_for_playback, stopping)
@@ -268,13 +269,14 @@ async def _run_turn(
   )
   if not completed:
     # Barge-in cut the reply short: the recorded response is only what was
-    # actually spoken. Follow it with a system-authored notice so later turns
-    # know the assistant was interrupted mid-sentence rather than choosing to
-    # stop there. The XML sentinel marks it as system context, not user speech.
+    # actually spoken. Follow it with an application-authored notice using the
+    # user role because some chat templates require every system-role message
+    # to precede the conversation. The XML sentinel distinguishes this context
+    # from the user's own words.
     history.append(
       ModelRequest(
         parts=[
-          SystemPromptPart(
+          UserPromptPart(
             content="<system-reminder>User interrupted your previous reply.</system-reminder>"
           )
         ]
