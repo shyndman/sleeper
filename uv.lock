@@ -1406,7 +1406,7 @@ wheels = [
 
 [[package]]
 name = "libsh"
-version = "0.3.0"
+version = "0.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -1414,9 +1414,9 @@ dependencies = [
     { name = "rich" },
     { name = "structlog" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6c/8c/3b055893f92d48d89c2c997e79a0dd891f0a584eba43baf6ceac7885e0d8/libsh-0.3.0.tar.gz", hash = "sha256:9cc22393f4415976708f803e2572fd844a46873944d83694414e4d06097de1d9", size = 6582, upload-time = "2026-07-06T07:04:48.461Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/56/b6/d7cc46426f4a8a91a40c5aa24826c580c51d652fba35e730e6f73eecbc4e/libsh-0.3.1.tar.gz", hash = "sha256:1f68fcc4d064bd4a2ce562c0eff286f3c85e4f4c86531100c58f0e4745eef270", size = 6610, upload-time = "2026-07-19T14:05:58.535Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/db/23/9072f032292192100f214c06ef00c86360863f51fc5b76905a3f3efdf1ac/libsh-0.3.0-py3-none-any.whl", hash = "sha256:3082099a0feac31ff74f0fcb3eeb9dfbde8911d2d1b4cb9b7bb8193271773690", size = 9307, upload-time = "2026-07-06T07:04:47.371Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/ad/baec705659bebed82dc0ef571965ae0715e24eec2cef5dc22db1773c74cf/libsh-0.3.1-py3-none-any.whl", hash = "sha256:517951c3ce3cadcf0c21727cdf65a98d133fef1df3a076780830d8d9fa7e7f53", size = 9353, upload-time = "2026-07-19T14:05:57.662Z" },
 ]
 
 [[package]]
