@@ -1,5 +1,7 @@
 """Voice-assistant LLM configuration and creation."""
 
+from datetime import datetime
+
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -26,6 +28,14 @@ engine, so write for the ear, not the page:
   the short version and offer to go deeper.
 """
 
+_LOCAL_DATETIME_FORMAT = "%A, %B %d, %Y at %I:%M %p %Z"
+
+
+# Gives the assistant the machine's current wall-clock time, including the weekday
+# and local timezone, so time-sensitive answers do not depend on model knowledge.
+def get_local_datetime() -> str:
+  return datetime.now().astimezone().strftime(_LOCAL_DATETIME_FORMAT)
+
 
 def create_llm_agent() -> Agent[None, str]:
   """Create the voice assistant agent over the local OpenAI-compatible server."""
@@ -33,4 +43,5 @@ def create_llm_agent() -> Agent[None, str]:
   return Agent(
     OpenAIChatModel(LLM_MODEL, provider=OpenAIProvider(base_url=LLM_URL, api_key="local")),
     instructions=SPEAKABLE_SYSTEM_PROMPT,
+    tools=[get_local_datetime],
   )

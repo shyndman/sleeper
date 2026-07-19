@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Callable
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 from typing import cast
@@ -21,6 +22,7 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 from pydantic_ai.exceptions import ModelAPIError
+from pydantic_ai.toolsets import FunctionToolset
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 from websockets.frames import Close
 from websockets.sync.client import connect
@@ -145,6 +147,21 @@ def test_agent_disables_thinking_for_every_run() -> None:
     thread.join()
 
   assert [request["reasoning_effort"] for request in requests] == ["none", "none"]
+
+
+def test_agent_exposes_only_local_datetime_tool() -> None:
+  agent = llm.create_llm_agent()
+  assert len(agent.toolsets) == 1
+  toolset = cast(FunctionToolset[None], agent.toolsets[0])
+
+  assert list(toolset.tools) == ["get_local_datetime"]
+
+
+def test_local_datetime_includes_correct_weekday() -> None:
+  weekday, rest = llm.get_local_datetime().split(", ", maxsplit=1)
+  local_datetime = datetime.strptime(rest.rsplit(" ", maxsplit=1)[0], "%B %d, %Y at %I:%M %p")
+
+  assert weekday == local_datetime.strftime("%A")
 
 
 def test_startup_warms_ollama_with_model_and_keep_alive() -> None:
