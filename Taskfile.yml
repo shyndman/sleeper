@@ -21,3 +21,11 @@ tasks:
       # expanded by the remote shell, not locally.
       - scp ./.env {{.DEPLOY_DEV_HOST}}:{{.DEPLOY_DEV_PATH}}
       - kitten ssh {{.DEPLOY_DEV_HOST}} "zsh -l -c 'cd {{.DEPLOY_DEV_PATH}} && docker compose pull && op run -- docker compose up --detach sleeper && docker compose logs --follow sleeper'" 
+
+  chat:
+    desc: Open an interactive text chat with the LLM inside the remote sleeper container
+    requires:
+      vars: [DEPLOY_DEV_HOST, DEPLOY_DEV_PATH]
+    interactive: true
+    cmds:
+      - kitten ssh {{.DEPLOY_DEV_HOST}} "zsh -l -c 'cd {{.DEPLOY_DEV_PATH}} && docker compose exec sleeper uv run --locked sleeper-chat'"

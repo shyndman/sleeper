@@ -25,6 +25,7 @@ dependencies = [
 [project.scripts]
 say = "sleeper.say:main"
 sleeper = "sleeper.__main__:main"
+sleeper-chat = "sleeper.chat:main"
 sleeper-client = "sleeper.client:main"
 
 [dependency-groups]
